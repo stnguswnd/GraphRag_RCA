@@ -1,0 +1,30 @@
+Deposition Defect Catalog
+Process Step: DEPO
+
+1. Center defects from gas-flow imbalance
+
+Center-clustered failures on the wafer map are frequently traced back to the
+deposition step. When the process gas is not delivered uniformly, the film grows
+thicker at the wafer center than at the edge. This center-thick film profile
+manifests as a Center defect cluster at electrical test.
+
+The immediate surface cause is gas flow imbalance during deposition: insufficient
+precursor gas flow starves the outer radius while the center over-deposits. Because
+the imbalance is a process-parameter deviation, it should be treated as a Parameter
+type cause, and it is tied to the deposition gas flow parameter running low.
+
+2. Upstream cause: mass flow controller drift
+
+Gas flow imbalance is often not the deepest cause. A frequent upstream driver is
+mass flow controller (MFC) drift in the deposition tool. As the MFC drifts out of
+calibration, it skews the delivered gas ratios, which in turn produces the flow
+imbalance described above. MFC drift is a machine issue and therefore also connects
+to the deposition gas flow parameter reading low.
+
+3. Confirming the cause
+
+Deposition gas flow telemetry should be examined for the suspect chamber and time
+window. Because MFC drift is a machine fault, maintenance and alarm history for the
+tool are useful, and the normal-lot ratio provides a negative control. When the
+Center signature is confirmed, the yield change point is worth locating to bound the
+onset of the excursion.

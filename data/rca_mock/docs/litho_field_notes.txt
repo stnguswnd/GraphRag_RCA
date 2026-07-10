@@ -1,0 +1,22 @@
+Lithography Field Notes
+Process Step: LITHO
+
+1. Edge-Loc defects from focus drift
+
+The Edge-Loc pattern shows failing die localized to one or more sectors of the wafer
+edge, rather than a continuous ring. In lithography, a recurring cause is focus drift
+near the wafer edge. When the exposure focus drifts away from best focus at the
+periphery, the aerial image blurs and the pattern fails locally, yielding localized
+edge defects. This should be read as distinct from an Edge-Ring signature, which is
+continuous and omni-directional around the wafer.
+
+Focus drift is a process-parameter deviation (Parameter type cause) and is tied to
+the focus parameter departing from its target — often reading low relative to best
+focus at the edge field.
+
+2. Confirming the cause
+
+Focus telemetry for the exposure tool should be reviewed across the suspect window.
+Because focus drift is a parameter deviation rather than a hardware failure, the most
+useful checks are telemetry and the negative-control normal-lot ratio, together with
+locating the yield change point to bound when the drift began.

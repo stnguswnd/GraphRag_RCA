@@ -1,0 +1,68 @@
+{
+  "_comment": "(:DetectionMethod) 시드 - MCP 도구 9종과 1:1. name은 서버 등록 도구명과 동일. role=verify는 가설별 검증 도구(가설에 실려 나감), role=pipeline은 오케스트레이터가 항상 부르는 도구(가설에 안 실림). args_template의 $변수는 런타임에 치환됨.",
+  "nodes": [
+    {
+      "name": "telemetry_check",
+      "mcp_tool": "query_telemetry",
+      "role": "verify",
+      "checks": "공정 변수가 실제로 튀었나",
+      "args_template": { "equipment_id": "$suspect_eq", "param": "$param", "time_range": "$window" }
+    },
+    {
+      "name": "maintenance_check",
+      "mcp_tool": "get_maintenance_history",
+      "role": "verify",
+      "checks": "정비 이력에 단서가 있나",
+      "args_template": { "equipment_id": "$suspect_eq", "time_range": "$window" }
+    },
+    {
+      "name": "alarm_check",
+      "mcp_tool": "get_alarm_history",
+      "role": "verify",
+      "checks": "알람이 울렸나",
+      "args_template": { "equipment_id": "$suspect_eq", "time_range": "$window" }
+    },
+    {
+      "name": "negative_control",
+      "mcp_tool": "get_normal_lot_ratio",
+      "role": "verify",
+      "checks": "같은 장비의 정상 lot 비율 (반대근거)",
+      "args_template": { "equipment_id": "$suspect_eq", "time_range": "$window" }
+    },
+    {
+      "name": "yield_change_point",
+      "mcp_tool": "detect_change_points",
+      "role": "verify",
+      "checks": "수율이 언제부터 꺾였나",
+      "args_template": { "lot_id": "$lot_id", "metric": "yield" }
+    },
+    {
+      "name": "commonality",
+      "mcp_tool": "run_commonality_analysis",
+      "role": "pipeline",
+      "checks": "불량 lot들의 공통 장비",
+      "args_template": { "lot_ids": "$fail_lots" }
+    },
+    {
+      "name": "lot_route",
+      "mcp_tool": "get_lot_history",
+      "role": "pipeline",
+      "checks": "lot이 거친 경로",
+      "args_template": { "lot_id": "$lot_id" }
+    },
+    {
+      "name": "timeline_check",
+      "mcp_tool": "get_lot_timeline",
+      "role": "pipeline",
+      "checks": "lot 시간축",
+      "args_template": { "lot_id": "$lot_id" }
+    },
+    {
+      "name": "wafer_map",
+      "mcp_tool": "get_wafer_map",
+      "role": "pipeline",
+      "checks": "웨이퍼맵 원본",
+      "args_template": { "wafer_id": "$wafer_id" }
+    }
+  ]
+}

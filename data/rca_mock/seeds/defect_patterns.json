@@ -1,0 +1,68 @@
+{
+  "_comment": "(:DefectPattern) 시드 - 9종 고정. name은 VLM 출력 클래스와 반드시 동일. spatial_keywords/expected_zone/expected_shape는 정합성 체크용이며 '연결(매칭)'에는 사용 금지 (Edge-Ring과 Donut이 둘 다 ring을 가짐).",
+  "nodes": [
+    {
+      "name": "Center",
+      "aliases": ["center defect", "center cluster", "bullseye center"],
+      "spatial_keywords": ["center", "middle", "core"],
+      "expected_zone": ["center"],
+      "expected_shape": ["blob", "cluster"]
+    },
+    {
+      "name": "Donut",
+      "aliases": ["donut defect", "ring band", "annulus"],
+      "spatial_keywords": ["ring", "annular", "band", "mid-radius"],
+      "expected_zone": ["mid"],
+      "expected_shape": ["ring"]
+    },
+    {
+      "name": "Edge-Loc",
+      "aliases": ["edge localized", "edge local cluster", "localized edge defect"],
+      "spatial_keywords": ["edge", "local", "arc", "sector"],
+      "expected_zone": ["edge"],
+      "expected_shape": ["arc", "cluster"]
+    },
+    {
+      "name": "Edge-Ring",
+      "aliases": ["edge ring defect", "edge ring", "peripheral ring", "outer ring"],
+      "spatial_keywords": ["edge", "ring", "peripheral", "omni"],
+      "expected_zone": ["edge"],
+      "expected_shape": ["ring"]
+    },
+    {
+      "name": "Loc",
+      "aliases": ["localized defect", "local cluster", "spot cluster"],
+      "spatial_keywords": ["local", "spot", "cluster"],
+      "expected_zone": ["any"],
+      "expected_shape": ["cluster"]
+    },
+    {
+      "name": "Near-Full",
+      "aliases": ["near full", "gross fail", "wafer-wide fail"],
+      "spatial_keywords": ["full", "widespread", "global"],
+      "expected_zone": ["any"],
+      "expected_shape": ["global"]
+    },
+    {
+      "name": "Scratch",
+      "aliases": ["scratch defect", "scratch line", "linear defect", "streak"],
+      "spatial_keywords": ["line", "linear", "streak", "scratch"],
+      "expected_zone": ["any"],
+      "expected_shape": ["line"]
+    },
+    {
+      "name": "Random",
+      "aliases": ["random defect", "sporadic", "no pattern"],
+      "spatial_keywords": ["random", "scattered", "sporadic"],
+      "expected_zone": ["any"],
+      "expected_shape": ["any"]
+    },
+    {
+      "name": "Normal",
+      "aliases": ["normal", "pass", "no defect"],
+      "spatial_keywords": ["clean", "none"],
+      "expected_zone": ["any"],
+      "expected_shape": ["any"]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "_comment": "(:ParameterType) 시드 - 20종 고정. name은 telemetry.param 컬럼과 일치해야 함 (join key). 정상범위/단위는 저장하지 않음 - 조회 시점에 query_telemetry 도구가 돌려주며, 정답 누출을 막기 위함.",
+  "join_key": "telemetry.param",
+  "nodes": [
+    { "name": "rf_power",        "aliases": ["rf power", "plasma power", "source power"] },
+    { "name": "bias_voltage",    "aliases": ["bias", "substrate bias", "rf bias"] },
+    { "name": "chamber_pressure","aliases": ["pressure", "process pressure"] },
+    { "name": "gas_flow_cf4",    "aliases": ["cf4 flow", "cf4"] },
+    { "name": "gas_flow_o2",     "aliases": ["o2 flow", "oxygen flow"] },
+    { "name": "depo_gas_flow",   "aliases": ["deposition gas flow", "precursor flow", "source gas flow"] },
+    { "name": "electrode_temp",  "aliases": ["electrode temperature", "cathode temp"] },
+    { "name": "wafer_temp",      "aliases": ["wafer temperature", "chuck temp", "esc temp"] },
+    { "name": "etch_time",       "aliases": ["etch duration", "process time"] },
+    { "name": "endpoint_time",   "aliases": ["endpoint", "eot", "endpoint detection time"] },
+    { "name": "focus",           "aliases": ["focus offset", "best focus", "focus position"] },
+    { "name": "exposure_dose",   "aliases": ["dose", "exposure energy"] },
+    { "name": "overlay",         "aliases": ["overlay error", "registration", "alignment error"] },
+    { "name": "develop_time",    "aliases": ["development time", "develop duration"] },
+    { "name": "depo_rate",       "aliases": ["deposition rate", "growth rate"] },
+    { "name": "film_thickness",  "aliases": ["thickness", "film thickness", "deposited thickness"] },
+    { "name": "slurry_flow",     "aliases": ["slurry flow rate", "slurry"] },
+    { "name": "polish_pressure", "aliases": ["down force", "polish down force", "head pressure"] },
+    { "name": "platen_speed",    "aliases": ["platen rotation", "table speed", "polish speed"] },
+    { "name": "megasonic_power", "aliases": ["megasonic", "megasonic energy", "acoustic power"] }
+  ]
+}
