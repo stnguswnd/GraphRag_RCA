@@ -19,3 +19,7 @@ htmlcov/
 .DS_Store
 
 *.log
+
+# 파이프라인 생성물 (재생성 가능)
+outputs/
+*.db

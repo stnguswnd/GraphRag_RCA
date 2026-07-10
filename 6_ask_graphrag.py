@@ -49,6 +49,9 @@ MATCH (p:DefectPattern {id: $pattern})-[a:ARISES_IN]->(s:ProcessStep)
 MATCH (fm:FailureMode)-[:OCCURS_IN]->(s)
 MATCH (fm)-[cb:CAUSED_BY]->(c:Cause)
 MATCH (c)-[ip:INVOLVES_PARAMETER]->(param:Parameter)
+// 공정 정합성: 검증 변수는 그 공정에서 실제 계측되는 것이어야 한다.
+// (병합된 FailureMode가 여러 공정에 걸쳐 타 공정 변수로 새는 것을 차단 — STATUS P3 방어)
+WHERE s.id IN param.steps
 RETURN s.id            AS step,
        fm.id           AS failure_mode,
        fm.name         AS failure_mode_name,
@@ -81,6 +84,40 @@ def fetch_hypotheses(graph: Neo4jGraph, pattern: str) -> list[dict]:
             best[key] = row
 
     return sorted(best.values(), key=lambda r: r["_score"], reverse=True)[:TOP_K]
+
+
+# =========================
+# 1b. 문헌 기반 후보 원인 (논문 표에서 온 DefectPattern -ATTRIBUTED_TO-> Cause)
+# -------------------------
+# fab 검증 백본(ARISES_IN 완전경로)과 달리, 논문은 패턴의 원인을 직접 준다.
+# 이 경로는 공정/고장모드를 거치지 않으므로 별도로 뽑아 '문헌 기반 후보'로 보고한다.
+# Parameter까지 이어지면 fab 검증도 가능하다(OPTIONAL).
+# =========================
+
+LITERATURE_QUERY = """
+MATCH (p:DefectPattern {id: $pattern})-[a:ATTRIBUTED_TO]->(c:Cause)
+OPTIONAL MATCH (c)-[ip:INVOLVES_PARAMETER]->(param:Parameter)
+RETURN c.id                       AS cause,
+       c.name                     AS cause_name,
+       c.description              AS cause_description,
+       a.source                   AS source,
+       coalesce(a.extraction_confidence, 3) AS confidence,
+       param.id                   AS parameter,
+       ip.direction               AS direction,
+       a.chunk_ids                AS evidence
+ORDER BY confidence DESC
+"""
+
+
+def fetch_literature_causes(graph: Neo4jGraph, pattern: str, limit: int = 5) -> list[dict]:
+    rows = graph.query(LITERATURE_QUERY, params={"pattern": pattern})
+    seen, out = set(), []
+    for row in rows:
+        if row["cause"] in seen:
+            continue
+        seen.add(row["cause"])
+        out.append(row)
+    return out[:limit]
 
 
 # =========================
@@ -159,24 +196,36 @@ def main() -> None:
         rows = fetch_hypotheses(graph, pattern)
 
         if not rows:
-            print("가설 없음. 그래프에 이 패턴의 완전한 경로")
+            print("fab 검증 가설 없음. 그래프에 이 패턴의 완전한 경로")
             print("(DefectPattern→ProcessStep→FailureMode→Cause→Parameter)가 없습니다.")
             print()
-            continue
+        else:
+            if len(rows) < TOP_K:
+                print(f"(경고: 완전한 경로가 {len(rows)}개뿐이라 가설 {len(rows)}건만 냅니다)")
+                print()
 
-        if len(rows) < TOP_K:
-            print(f"(경고: 완전한 경로가 {len(rows)}개뿐이라 가설 {len(rows)}건만 냅니다)")
-            print()
+            for i, (sentence, row) in enumerate(zip(synthesize(llm, pattern, rows), rows), start=1):
+                print(f"{i}. {sentence}")
+                print(
+                    f"   근거: {pattern} -[ARISES_IN]-> {row['step']}"
+                    f" <-[OCCURS_IN]- {row['failure_mode']}"
+                    f" -[CAUSED_BY]-> {row['cause']}"
+                    f" -[INVOLVES_PARAMETER]-> {row['parameter']}"
+                )
+                print(f"   검증: telemetry.param = '{row['parameter']}' (방향 {row['direction']})")
+                print()
 
-        for i, (sentence, row) in enumerate(zip(synthesize(llm, pattern, rows), rows), start=1):
-            print(f"{i}. {sentence}")
-            print(
-                f"   근거: {pattern} -[ARISES_IN]-> {row['step']}"
-                f" <-[OCCURS_IN]- {row['failure_mode']}"
-                f" -[CAUSED_BY]-> {row['cause']}"
-                f" -[INVOLVES_PARAMETER]-> {row['parameter']}"
-            )
-            print(f"   검증: telemetry.param = '{row['parameter']}' (방향 {row['direction']})")
+        # 문헌 기반 후보 원인 (논문 표에서 온 것. fab 검증 백본과 구분해서 보고)
+        lit = fetch_literature_causes(graph, pattern)
+        if lit:
+            print(f"[문헌 기반 후보 원인] (논문 표 근거, {len(lit)}건)")
+            for row in lit:
+                verify = (
+                    f"telemetry.param='{row['parameter']}' (방향 {row['direction']})"
+                    if row["parameter"] else "연결된 검증 변수 없음(정성적 단서)"
+                )
+                print(f"   · {row['cause_name']} ({row['cause']})")
+                print(f"     {pattern} -[ATTRIBUTED_TO/{row['source']}]-> {row['cause']} | 검증: {verify}")
             print()
 
 

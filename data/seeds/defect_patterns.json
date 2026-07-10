@@ -1,5 +1,6 @@
 {
-  "_comment": "(:DefectPattern) 시드 - 3종 고정 (schema.md). id는 유일 키이며 VLM 출력 클래스와 반드시 동일. 이 목록을 바꾸면 5_build_kg_from_chunks.py의 DefectPatternId Literal도 함께 바꿔야 한다. spatial_keywords/expected_zone/expected_shape는 정합성 체크용이며 '연결(매칭)'에는 사용 금지.",
+  "_comment": "(:DefectPattern) 시드 - WM-811K 표준 8종. id는 유일 키이며 VLM(WM-811K 분류기) 출력 클래스와 일치. 이 목록을 바꾸면 5_build_kg_from_chunks.py의 DefectPatternId Literal도 함께 바꿔야 한다(assert_enums_match_seeds가 강제). spatial_keywords/expected_zone/expected_shape는 정합성 체크용이며 '연결(매칭)'에는 사용 금지 - 매칭은 aliases만.",
+  "_coverage_note": "8종 모두 동등한 DefectPattern이다(VLM도 8종 분류). 차이는 '분류'가 아니라 '문서 커버리지'뿐: Center/Scratch/Edge-Ring 은 doc_A(txt)에 ARISES_IN(패턴->공정)까지 있어 fab 검증 백본 경로가 완성되고, 나머지 5종은 아직 문헌(ATTRIBUTED_TO, 논문 표) 기반 원인만 있다. doc_A류 문서에 그 5종의 공정 연관을 추가하면 동일하게 백본 경로를 갖는다.",
   "nodes": [
     {
       "id": "Center",
@@ -10,12 +11,20 @@
       "expected_shape": ["blob", "cluster"]
     },
     {
-      "id": "Scratch",
-      "name": "Scratch",
-      "aliases": ["scratch defect", "scuff mark", "surface scratch"],
-      "spatial_keywords": ["scratch", "scuff", "surface"],
+      "id": "Donut",
+      "name": "Donut",
+      "aliases": ["donut", "doughnut", "ring with an opening", "ring with a hole"],
+      "spatial_keywords": ["donut", "ring", "annulus"],
       "expected_zone": ["mid"],
-      "expected_shape": ["line", "elongated"]
+      "expected_shape": ["ring"]
+    },
+    {
+      "id": "Edge-Loc",
+      "name": "Edge-Loc",
+      "aliases": ["edge-loc", "edge loc", "edge local", "edge location", "edge cluster", "edge localized"],
+      "spatial_keywords": ["edge", "local", "cluster"],
+      "expected_zone": ["edge"],
+      "expected_shape": ["cluster"]
     },
     {
       "id": "Edge-Ring",
@@ -24,6 +33,38 @@
       "spatial_keywords": ["edge", "ring", "peripheral", "omni"],
       "expected_zone": ["edge"],
       "expected_shape": ["ring"]
+    },
+    {
+      "id": "Loc",
+      "name": "Loc",
+      "aliases": ["loc", "local", "localized", "local cluster", "inner cluster"],
+      "spatial_keywords": ["local", "inner", "cluster"],
+      "expected_zone": ["mid"],
+      "expected_shape": ["cluster"]
+    },
+    {
+      "id": "Near-Full",
+      "name": "Near-Full",
+      "aliases": ["near-full", "near full", "nearfull", "full wafer", "entire wafer", "whole wafer"],
+      "spatial_keywords": ["full", "entire", "whole"],
+      "expected_zone": ["all"],
+      "expected_shape": ["blob"]
+    },
+    {
+      "id": "Random",
+      "name": "Random",
+      "aliases": ["random", "sporadic", "scattered", "random defect"],
+      "spatial_keywords": ["random", "sporadic", "scattered"],
+      "expected_zone": ["all"],
+      "expected_shape": ["scattered"]
+    },
+    {
+      "id": "Scratch",
+      "name": "Scratch",
+      "aliases": ["scratch defect", "scuff mark", "surface scratch", "linear defect"],
+      "spatial_keywords": ["scratch", "scuff", "surface", "linear"],
+      "expected_zone": ["mid"],
+      "expected_shape": ["line", "elongated"]
     }
   ]
 }

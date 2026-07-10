@@ -1,0 +1,44 @@
+# fab_model.yaml — 팹 파라미터 "정상 운전 범위" 정의 (정답 그라운드 트루스)
+#
+# fab.md 규칙: 정상범위는 telemetry 테이블에 저장하지 않고 여기(fab_model)에서만 조회한다.
+# 키는 data/seeds/parameters.json 의 20개 Parameter id 와 문자열이 정확히 일치해야 한다
+# (telemetry.param <-> 이 키 <-> Neo4j Parameter.id 가 모두 같은 join key).
+#
+# rf_power / chamber_pressure 는 ETCH·DEPO 두 장비군이 공유하는 하나의 Parameter 노드이므로
+# 정상범위도 파라미터 id 당 하나만 둔다(검증 조인이 param id 만으로 일어나기 때문).
+# 단위(unit)는 참고용 주석일 뿐 검증 로직은 순수하게 min/max 숫자만 비교한다.
+
+parameters:
+  # ---- LITHO ----
+  exposure_dose:      { min: 28.0,  max: 32.0,  unit: "mJ/cm^2" }
+  focus_offset:       { min: -10.0, max: 10.0,  unit: "nm" }
+  stage_temp:         { min: 22.5,  max: 23.5,  unit: "degC" }
+  alignment_offset:   { min: 0.0,   max: 5.0,   unit: "nm(overlay)" }
+
+  # ---- ETCH / DEPO 공유 ----
+  rf_power:           { min: 900.0, max: 1100.0, unit: "W" }
+  chamber_pressure:   { min: 40.0,  max: 60.0,   unit: "mTorr" }
+
+  # ---- ETCH ----
+  he_flow:            { min: 8.0,   max: 12.0,  unit: "sccm" }
+  temperature:        { min: 55.0,  max: 65.0,  unit: "degC" }
+  etch_rate:          { min: 480.0, max: 520.0, unit: "nm/min" }
+
+  # ---- DEPO ----
+  gas_flow:           { min: 80.0,  max: 120.0, unit: "sccm" }
+  susceptor_temp:     { min: 390.0, max: 410.0, unit: "degC" }
+  deposition_rate:    { min: 90.0,  max: 110.0, unit: "nm/min" }
+
+  # ---- CMP ----
+  down_force:         { min: 3.0,   max: 5.0,   unit: "psi" }
+  slurry_flow:        { min: 150.0, max: 250.0, unit: "ml/min" }
+
+  # ---- CLEAN ----
+  flow_rate:          { min: 1.5,   max: 2.5,   unit: "L/min" }
+  megasonic_power:    { min: 40.0,  max: 60.0,  unit: "W" }
+  chemical_temp:      { min: 60.0,  max: 70.0,  unit: "degC" }
+  rinse_time:         { min: 60.0,  max: 90.0,  unit: "s" }
+
+  # ---- EDS ----
+  chuck_temp:         { min: 24.0,  max: 26.0,  unit: "degC" }
+  contact_resistance: { min: 0.5,   max: 1.5,   unit: "ohm" }

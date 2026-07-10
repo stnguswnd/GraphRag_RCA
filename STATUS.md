@@ -13,10 +13,10 @@
 
 ```
 DefectPattern ──ARISES_IN──> ProcessStep <──OCCURS_IN── FailureMode
-                              (join)                        │ CAUSED_BY
-Equipment ──PART_OF────────> ProcessStep                    ▼
-                                                          Cause ──INVOLVES_PARAMETER──> Parameter
-                                                                                    (→ fab SQL)
+      │                       (join)                        │ CAUSED_BY
+      │ ATTRIBUTED_TO(문헌)                                 ▼
+      └───────────────────────────────────────────────► Cause ──INVOLVES_PARAMETER──> Parameter
+Equipment ──PART_OF────────> ProcessStep                                          (→ fab SQL)
 ```
 
 이전 스키마에서 바뀐 점:
@@ -35,6 +35,18 @@ Equipment ──PART_OF────────> ProcessStep                    
 **0~4단계 실행 검증 완료** (문헌 4편 → 청크 11개, 시드 3/6/20 적재, 잔재 라벨 0).
 5~6단계는 OpenAI 호출이라 미실행.
 
+**2026-07-10(2차): 학술 논문(pdf) 활용 추가 — 표 파싱 + 문헌 원인 흡수 (branch `gus`).**
+- `2_load_txt.py`: pdf를 pdfplumber **컬럼 인식**(2단 편집 좌→우, `x_tolerance=1.0`)으로 추출.
+  기존 pypdf는 2단·테두리 없는 표를 뒤섞었는데, 이제 "패턴 | 원인" 행이 살아난다.
+- `DefectPattern` **3→8종**(WM-811K). `defect_patterns.json` + `5_..`의 Literal 함께 갱신(assert 통과 확인).
+- 새 관계 **`ATTRIBUTED_TO`**(`DefectPattern→Cause`, `source='literature'`). 논문 표의 패턴→원인을
+  백본에 직접 흡수(같은 `Cause` 라벨 공유, 도메인 이중화 없음).
+- `5b_extract_pattern_causes.py` 신설: pdf 청크 중 **패턴 언급 청크만 prefilter** 후 패턴→원인 타깃 추출.
+  `5_..`는 이제 **txt만** 처리(논문 노이즈 회피).
+- `6_ask_graphrag.py`: 백본 가설 + **"문헌 기반 후보 원인"**(ATTRIBUTED_TO) 함께 보고.
+- **검증:** 2·3단계 재실행(509청크), 5b를 ref56 표 청크에 드라이 실행 → Center←RF/액체흐름,
+  Edge-Ring←RTP온도이상 등 정상 추출 확인. **Neo4j 적재는 아직 미실행**(사용자 실행 대기).
+
 ---
 
 ## 2. 파일 구조
@@ -50,11 +62,12 @@ Equipment ──PART_OF────────> ProcessStep                    
 ### 파이프라인 코드 (루트)
 - `0_reset.py` — Neo4j DB 전체 초기화 (노드/관계/제약/인덱스)
 - `1_test_connection.py` — Neo4j 연결 확인
-- `2_load_txt.py` — 문헌 로드 → `outputs/parsed_docs.jsonl`
+- `2_load_txt.py` — 문헌 로드(txt + **pdf 컬럼 인식 추출**) → `outputs/parsed_docs.jsonl`
 - `3_split.py` — 청킹 → `outputs/chunks.jsonl` (chunk_id = `{doc_id}#c{nn}`)
 - `4_ingest_chunks_to_neo4j.py` — 시드 앵커 3종 적재 + Chunk 적재 + NEXT_CHUNK
-- `5_build_kg_from_chunks.py` — LLM으로 FailureMode/Cause/Equipment + 4종 관계 추출, PART_OF는 규칙
-- `6_ask_graphrag.py` — GraphCypherQAChain 질의응답
+- `5_build_kg_from_chunks.py` — **txt만**: FailureMode/Cause/Equipment + 4종 관계 추출, PART_OF는 규칙
+- `5b_extract_pattern_causes.py` — **pdf 논문**: 패턴→원인 표만 추출 → `DefectPattern-ATTRIBUTED_TO->Cause`
+- `6_ask_graphrag.py` — 결정적 순회로 가설 + 문헌 기반 후보 원인
 
 실행 순서는 `README.md` 참조.
 
@@ -84,7 +97,14 @@ Equipment ──PART_OF────────> ProcessStep                    
 - `schema.md`의 예시를 따라 `FailureMode.id`를 맨 이름(`post_etch_residue`)으로 뒀다.
 - 그래서 ETCH의 "particle contamination"과 CLEAN의 "particle contamination"이 **한 노드로 병합**되고,
   `OCCURS_IN`이 두 공정을 가리키게 된다.
-- 의도한 동작이 아니면 `{STEP}:{name}` 형태로 바꿔야 한다. **미결정.**
+- **관측된 실제 피해**: `wafer_surface_damage`가 CMP·CLEAN에 병합돼, `Scratch→CMP` 경로가
+  CLEAN 전용 변수 `megasonic_power`까지 새어 "CMP인데 megasonic 확인" 같은 잘못된 가설을 냈다.
+  (fab 검증 단계 7_verify가 "CMP 텔레메트리 없음"으로 이 오류를 드러냈다.)
+- **완화(2026-07-10 적용)**: 6단계·7_verify의 가설 쿼리에 `WHERE s.id IN param.steps` 가드 추가.
+  검증 변수가 그 공정 소속일 때만 가설로 인정 → cross-step 누수를 **출력 단계에서 차단**.
+  (전수조사 결과 누수는 이 1건뿐이었다.)
+- **근본 해결(미결정)**: `FailureMode.id`를 `{STEP}:{name}`로 스코프하면 병합 자체가 사라진다.
+  그래프 데이터까지 깨끗하게 하려면 이 변경 + `5` 재실행 필요.
 
 ---
 

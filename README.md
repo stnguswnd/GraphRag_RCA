@@ -2,7 +2,7 @@
 
 반도체 웨이퍼 결함의 **근본원인 분석(RCA)** 을 위한 지식그래프 파이프라인.
 
-공정 문헌(`.txt`)에서 "어떤 불량 패턴이 어느 공정을 의심케 하는가",
+공정 문헌(`.txt` / `.pdf`)에서 "어떤 불량 패턴이 어느 공정을 의심케 하는가",
 "그 공정에서 어떤 고장 모드가 어떤 원인으로 생기는가", "그 원인은 어떤 계측 변수와 얽히는가"를
 LLM으로 추출해 Neo4j 그래프로 만든다.
 
@@ -10,11 +10,12 @@ LLM으로 추출해 Neo4j 그래프로 만든다.
 가설 검증은 별도 fab 데이터(SQL)가 맡고, 그래프는 `Parameter` 노드로 그 SQL과 이어진다.
 
 ```text
-.txt 문헌
-  -> 로드/정제        (2_load_txt.py)
+문헌 (.txt / .pdf)
+  -> 로드/정제        (2_load_txt.py)           # pdf는 컬럼 인식 추출(2단·표 대응)
   -> 청킹             (3_split.py)
   -> 시드 앵커 + Chunk 적재 (4_ingest_chunks_to_neo4j.py)
-  -> LLM으로 KG 추출  (5_build_kg_from_chunks.py)
+  -> LLM으로 KG 추출  (5_build_kg_from_chunks.py)      # 백본: txt troubleshooting 문서
+  -> 논문 패턴→원인 추출 (5b_extract_pattern_causes.py)  # 논문 표 -> DefectPattern-ATTRIBUTED_TO->Cause
   -> GraphRAG 질의응답 (6_ask_graphrag.py)
 ```
 
@@ -55,12 +56,16 @@ cp .env_example .env            # NEO4J_*, OPENAI_API_KEY 채우기
 ```bash
 python 1_test_connection.py            # Neo4j 연결 확인
 python 0_reset.py                      # DB 전체 초기화 (스키마 변경 후 필수)
-python 2_load_txt.py                   # data/docs/*.txt -> outputs/parsed_docs.jsonl
+python 2_load_txt.py                   # data/docs/*.{txt,pdf} -> outputs/parsed_docs.jsonl
 python 3_split.py                      #                -> outputs/chunks.jsonl
 python 4_ingest_chunks_to_neo4j.py     # 시드 앵커 + Document/Chunk 적재
-python 5_build_kg_from_chunks.py       # LLM 추출 -> outputs/extracted_kg.jsonl + Neo4j
-python 6_ask_graphrag.py               # Text2Cypher 질의응답
+python 5_build_kg_from_chunks.py       # txt 백본 추출 -> outputs/extracted_kg.jsonl + Neo4j
+python 5b_extract_pattern_causes.py    # 논문 패턴->원인 추출 -> ATTRIBUTED_TO + Neo4j
+python 6_ask_graphrag.py               # 가설 + 문헌 기반 후보 원인
 ```
+
+> 5번은 기본적으로 txt 문서만 처리한다(논문은 노이즈가 커서 백본에 안 넣는다).
+> 5b는 논문(pdf)에서 결함 패턴의 원인 표만 타깃 추출한다. 둘 다 4번 뒤 순서 무관하게 돌린다.
 
 > `0_reset.py`를 건너뛰고 스키마를 바꾸면 중복 노드가 생긴다.
 > Neo4j의 UNIQUE 제약은 null을 무시하므로, `id`가 없는 옛 노드를 `MERGE {id: ...}`가 찾지 못한다.
@@ -69,16 +74,19 @@ python 6_ask_graphrag.py               # Text2Cypher 질의응답
 
 ```text
 data/
-  docs/     문헌 4편
-    doc_A_wafermap_patterns.txt      패턴 -> 공정        (ARISES_IN)
-    doc_B_etch_troubleshooting.txt   ETCH 고장 -> 원인 -> 변수
-    doc_C_depo_troubleshooting.txt   DEPO
-    doc_D_cmp_troubleshooting.txt    CMP
+  docs/
+    doc_A_wafermap_patterns.txt      패턴 -> 공정        (ARISES_IN)   [백본]
+    doc_B~doc_G_*_troubleshooting.txt  공정별 고장 -> 원인 -> 변수      [백본]
+    ref*.pdf                         학술 논문 (패턴->원인 표)          [5b가 처리]
   seeds/    고정 vocabulary (문헌에서 뽑지 않고 미리 적재하는 앵커)
-    defect_patterns.json   3종   VLM 출력 클래스와 일치해야 함
+    defect_patterns.json   8종   WM-811K, VLM 출력 클래스와 정렬
     process_steps.json     6종   join key: lot_history.step
     parameters.json       20종   join key: telemetry.param
 ```
+
+- **txt(백본):** `5_build_kg_from_chunks.py`가 통제된 troubleshooting 문서로 FailureMode/Cause/관계 추출.
+- **pdf(논문):** `5b_extract_pattern_causes.py`가 결함 패턴의 원인 표만 타깃 추출해
+  `DefectPattern -[:ATTRIBUTED_TO {source:'literature'}]-> Cause`로 백본에 흡수(같은 `Cause` 라벨 공유).
 
 `FailureMode` / `Cause` / `Equipment`만 LLM이 문헌에서 자유롭게 만든다.
 나머지 세 라벨은 시드에 있는 것에 **연결만** 하고 새로 만들지 않는다.

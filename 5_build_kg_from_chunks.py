@@ -51,8 +51,11 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
 
 ProcessStepId = Literal["LITHO", "ETCH", "DEPO", "CMP", "CLEAN", "EDS"]
 
-# seeds/defect_patterns.json 과 반드시 동일. id == VLM 출력 클래스
-DefectPatternId = Literal["Center", "Scratch", "Edge-Ring"]
+# seeds/defect_patterns.json 과 반드시 동일. id == VLM 출력 클래스 (WM-811K 8종)
+DefectPatternId = Literal[
+    "Center", "Donut", "Edge-Loc", "Edge-Ring",
+    "Loc", "Near-Full", "Random", "Scratch",
+]
 
 # seeds/parameters.json 과 반드시 동일. id == fab telemetry.param
 ParameterId = Literal[
@@ -237,10 +240,10 @@ def build_prompt(chunk: dict) -> str:
 공정 단계(ProcessStep) 6종:
   LITHO, ETCH, DEPO, CMP, CLEAN, EDS
 
-불량 패턴(DefectPattern) 3종:
-  Center, Scratch, Edge-Ring
+불량 패턴(DefectPattern) 8종 (WM-811K):
+  Center, Donut, Edge-Loc, Edge-Ring, Loc, Near-Full, Random, Scratch
   (웨이퍼맵 상의 공간 패턴만 해당. "circular ring"→Edge-Ring, "bulls eye"→Center,
-   "linear defect"/"scuff mark"→Scratch)
+   "linear defect"/"scuff mark"→Scratch, "ring with a hole"→Donut, "entire wafer"→Near-Full)
 
 공정 변수(Parameter) 20종:
   exposure_dose, focus_offset, stage_temp, alignment_offset,
@@ -262,7 +265,7 @@ def build_prompt(chunk: dict) -> str:
   예: 'Edge-Ring' (O) / 'edge-ring' (X), 'ETCH' (O) / 'etching' (X)
 - ARISES_IN은 **원문에 공정 이름이 실제로 등장할 때만** 만드세요.
   공정이 언급되지 않은 서론·요약 문단에서는 ARISES_IN을 추측해 만들지 마세요.
-- 불량 패턴(Center/Scratch/Edge-Ring)은 DefectPattern이지 FailureMode가 아닙니다.
+- 불량 패턴(위 8종)은 DefectPattern이지 FailureMode가 아닙니다.
   'scratch_pattern' 같은 FailureMode를 만들지 마세요. 패턴은 ARISES_IN의 source로만 씁니다.
   FailureMode는 공정 내부의 고장(post-etch residue, overlay misregistration 등)입니다.
 - 모든 FailureMode에는 OCCURS_IN 관계가 정확히 하나 있어야 합니다.
@@ -556,6 +559,7 @@ def load_chunks(path: Path) -> list[dict]:
                 "chunk_index": row["chunk_index"],
                 "text": row["page_content"],
                 "doc_id": metadata.get("doc_id"),
+                "file_type": metadata.get("file_type"),
             })
     return chunks
 
@@ -568,6 +572,18 @@ def main() -> None:
     assert_enums_match_seeds()
 
     chunks = load_chunks(CHUNKS_PATH)
+
+    # 백본(FailureMode/Cause/공정 관계)은 통제된 troubleshooting 문서(txt)에서만 뽑는다.
+    # 논문(pdf)은 노이즈가 커서 여기 넣지 않고, 패턴->원인만 5b_extract_pattern_causes.py가
+    # 타깃 추출한다. 굳이 pdf도 백본에 넣으려면 인자로 doc_id를 넘긴다.
+    only_docs = set(sys.argv[1:])
+    if only_docs:
+        chunks = [c for c in chunks if c["doc_id"] in only_docs]
+        print("대상 doc_id 필터:", only_docs)
+    else:
+        chunks = [c for c in chunks if c.get("file_type") != "pdf"]
+        print("대상: txt 문서만 (pdf 논문은 5b가 담당)")
+
     print("처리할 청크 수:", len(chunks))
 
     graph = get_graph()

@@ -39,9 +39,13 @@ GraphRAG(문서/도메인 지식) 기반의 **원인 가설 생성용** 그래�
 ### 고정 vocabulary
 추출기는 아래 목록 중 하나로만 매핑한다. 목록에 없으면 매핑 보류.
 
-- **DefectPattern:** `Center`, `Scratch`, `Edge-Ring`
+- **DefectPattern:** WM-811K 8종 — `Center`, `Donut`, `Edge-Loc`, `Edge-Ring`, `Loc`, `Near-Full`, `Random`, `Scratch`
 - **ProcessStep:** `LITHO`, `ETCH`, `DEPO`, `CMP`, `CLEAN`, `EDS`
 - **Parameter:** `fab.md`의 장비군별 파라미터 20종 (`seeds/parameters.json`)
+
+> DefectPattern은 WM-811K 표준 8종이라 VLM 분류기와 정렬된다. 이 중 `Center`/`Scratch`/`Edge-Ring`만
+> `doc_A`(txt)에 `ARISES_IN`(패턴→공정)이 있어 fab 검증 경로가 완성된다. 나머지 5종은 현재
+> 논문(`ATTRIBUTED_TO`) 기반 원인만 붙는다.
 
 세 라벨의 노드는 적재 전 **사전 시딩**되며, ingest는 새로 생성하지 않고 연결만 한다.
 `Parameter`도 join key를 지켜야 하므로 자유 추출이 아니라 고정 목록으로 다룬다.
@@ -70,9 +74,16 @@ schema를 정적으로 만들어야 해서). 시드와 어긋나면 실행 즉�
 | B | `OCCURS_IN` | `FailureMode` | → | `ProcessStep` | 이 고장이 어느 공정에서 일어나는가 |
 | B | `CAUSED_BY` | `FailureMode` | → | `Cause` | 무엇이 원인인가 |
 | B | `INVOLVES_PARAMETER` | `Cause` | → | `Parameter` | 어떤 변수가 관여하는가 |
+| C | `ATTRIBUTED_TO` | `DefectPattern` | → | `Cause` | (문헌) 이 패턴의 원인은 무엇인가 |
 | — | `PART_OF` | `Equipment` | → | `ProcessStep` | 장비가 어느 공정군에 속하는가 |
 
 `PART_OF`는 LLM이 추출하지 않는다. `Equipment.equip_group`에서 규칙으로 파생한다.
+
+**문서 C (논문 표):** `DefectPattern → Cause` 직결.
+논문은 결함 패턴의 원인(source of defects)을 표로 직접 준다(예: "Center ← 불규칙 RF 동작").
+공정/고장모드를 거치지 않으므로 백본의 `CAUSED_BY` 경로에 담기지 않는다. 그래서 `ATTRIBUTED_TO`로
+`DefectPattern`에 바로 잇되, `source='literature'` 속성으로 fab 검증 백본(A·B)과 구분한다.
+`Cause`는 백본과 **같은 라벨을 공유**한다(도메인 이중화 방지). `5b_extract_pattern_causes.py`가 담당.
 
 ### 방향 원칙
 - `DefectPattern`과 `FailureMode`는 둘 다 `ProcessStep`으로 향한다 (join 노드로 수렴).
@@ -82,6 +93,7 @@ schema를 정적으로 만들어야 해서). 시드와 어긋나면 실행 즉�
 - 공통: `extraction_confidence`(1~5), `description`, `quotes`, `chunk_ids`(근거 청크)
 - `ARISES_IN` 전용: `occurrence_prior` (`high`/`mid`/`low`)
 - `INVOLVES_PARAMETER` 전용: `direction` (`high`/`low`)
+- `ATTRIBUTED_TO` 전용: `source` (현재 `literature`) — fab 검증 백본과 구분하는 태그
 
 ---
 
@@ -89,18 +101,21 @@ schema를 정적으로 만들어야 해서). 시드와 어긋나면 실행 즉�
 
 ```
 DefectPattern ──ARISES_IN──────────────┐
- (Edge-Ring)                            ▼
-                                   ProcessStep ◄──OCCURS_IN── FailureMode
-                                     (ETCH)      (join)       (post-etch residue)
-                                                                    │ CAUSED_BY
-                                                                    ▼
-Equipment ──PART_OF──> ProcessStep                                Cause
- (ETCH-03)                                                    (high etch rate)
-                                                                    │ INVOLVES_PARAMETER
+ (Edge-Ring)   │                        ▼
+               │                   ProcessStep ◄──OCCURS_IN── FailureMode
+               │                     (ETCH)      (join)       (post-etch residue)
+               │                                                    │ CAUSED_BY
+               │ ATTRIBUTED_TO (문헌)                               ▼
+               └──────────────────────────────────────────────► Cause
+Equipment ──PART_OF──> ProcessStep                           (high etch rate)
+ (ETCH-03)                                                          │ INVOLVES_PARAMETER
                                                                     ▼
                                                                 Parameter
                                                              (etch_rate → SQL)
 ```
+
+`ATTRIBUTED_TO`는 논문이 주는 패턴→원인 지름길이다. 공정/고장모드를 건너뛰고 `Cause`에 바로 닿는다.
+그 `Cause`가 `INVOLVES_PARAMETER`로 `Parameter`까지 이어지면 fab 검증도 가능해진다.
 
 - **질의 진입점:** `DefectPattern` (고정 3개)
 - **join 노드:** `ProcessStep` — 문서 A·B가 만나는 지점
@@ -112,6 +127,10 @@ Equipment ──PART_OF──> ProcessStep                                Cause
 2. 각 `ProcessStep`에 `OCCURS_IN`으로 걸린 `FailureMode`들을 후보로 모은다.
 3. 각 `FailureMode` → `Cause` → `Parameter` 경로 하나하나가 **가설 1건**.
 4. 그 `Parameter`(+향후 maintenance/recipe)를 fab SQL로 검증해 가설을 채택/기각.
+
+**문헌 보조 경로:** 위 백본에 완전한 경로가 없어도, `DefectPattern -ATTRIBUTED_TO-> Cause`로
+논문 기반 후보 원인을 추가로 얻는다(`6_ask_graphrag.py`가 "문헌 기반 후보 원인"으로 보고).
+그 `Cause`가 `INVOLVES_PARAMETER`를 가지면 fab 검증까지 이어진다.
 
 ---
 
