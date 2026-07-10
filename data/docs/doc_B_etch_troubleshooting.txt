@@ -8,7 +8,15 @@ Incorrect etch rate
 Incorrect etch rate is a failure mode that occurs in the ETCH step. One cause of
 incorrect etch rate is RF power drift, which involves the rf_power parameter.
 Another cause of incorrect etch rate is chamber pressure deviation, which
-involves the chamber_pressure parameter.
+involves the chamber_pressure parameter. Incorrect etch rate is also caused by
+improper maintenance, which is checked by reviewing whether a chamber wet clean
+was performed on schedule. A further cause is an incorrect process recipe, which
+is checked by verifying the process recipe loaded for the wafer.
+
+Plasma damage
+Plasma damage is a failure mode that occurs in the ETCH step. It is caused by
+improper maintenance, which is checked by reviewing whether a chamber wet clean
+was performed on schedule.
 
 Post-etch residue
 Post-etch residue is a failure mode that occurs in the ETCH step. A common cause

@@ -36,17 +36,24 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
 
 
 # =========================
-# 2. KG 스키마 정의 (schema.md)
+# 2. KG 스키마 정의 (schema_v2.md)
 # -------------------------
-# 문헌에서 자유롭게 만드는 노드는 FailureMode / Cause / Equipment 셋.
+# 문헌에서 자유롭게 만드는 노드는 FailureMode / Cause / Maintenance / Recipe.
 # DefectPattern / ProcessStep / Parameter 는 고정 vocabulary(앵커)이며
 # 4번에서 시드로 미리 적재된다. 여기서는 새로 만들지 않고 연결만 한다.
 #
 #   DefectPattern -[ARISES_IN]->  ProcessStep      (문서 A)
 #   FailureMode   -[OCCURS_IN]->  ProcessStep      (문서 B)
 #   FailureMode   -[CAUSED_BY]->  Cause            (문서 B)
-#   Cause         -[INVOLVES_PARAMETER]-> Parameter (문서 B)
-#   Equipment     -[PART_OF]->    ProcessStep      (규칙, LLM 아님)
+#   Cause         -[VERIFIED_BY]-> Parameter | Maintenance | Recipe   (문서 B)
+#
+#   DefectPattern -[ATTRIBUTED_TO]-> Cause         (문서 C: ref56 Table 1)
+#   문헌이 공정을 거치지 않고 패턴 -> 원인을 바로 말할 때 쓴다.
+#   이 Cause는 공정을 모르므로 Parameter(자동 검증)에 닿지 못한다. 수동 확인 대상이다.
+#
+# 세 evidence 라벨은 공통 슈퍼라벨 :Evidence 를 함께 갖는다.
+# Parameter 만 fab SQL로 자동 검증되고(telemetry.param 조인),
+# Maintenance/Recipe 는 조회 힌트라 수동 확인 대상이다.
 # =========================
 
 ProcessStepId = Literal["LITHO", "ETCH", "DEPO", "CMP", "CLEAN", "EDS"]
@@ -65,11 +72,22 @@ ParameterId = Literal[
 ]
 
 RelationshipKind = Literal[
-    "ARISES_IN",            # DefectPattern -> ProcessStep
-    "OCCURS_IN",            # FailureMode   -> ProcessStep
-    "CAUSED_BY",            # FailureMode   -> Cause
-    "INVOLVES_PARAMETER",   # Cause         -> Parameter
+    "ARISES_IN",       # DefectPattern -> ProcessStep
+    "ATTRIBUTED_TO",   # DefectPattern -> Cause   (공정을 거치지 않는 직결 서술)
+    "OCCURS_IN",       # FailureMode   -> ProcessStep
+    "CAUSED_BY",       # FailureMode   -> Cause
+    "VERIFIED_BY",     # Cause         -> Parameter | Maintenance | Recipe
 ]
+
+# VERIFIED_BY의 대상 라벨. 다형 관계라 LLM이 라벨을 함께 지목해야 한다.
+EvidenceLabel = Literal["Parameter", "Maintenance", "Recipe"]
+
+# evidence 라벨 -> 검증에 쓸 fab 테이블
+FAB_TABLE = {
+    "Parameter": "telemetry",
+    "Maintenance": "maintenance",
+    "Recipe": "lot_history",
+}
 
 PROCESS_STEP_IDS: set[str] = set(get_args(ProcessStepId))
 DEFECT_PATTERN_IDS: set[str] = set(get_args(DefectPatternId))
@@ -126,12 +144,77 @@ def _build_alias_index(file_name: str) -> dict[str, str]:
 
 DEFECT_PATTERN_INDEX = _build_alias_index("defect_patterns.json")
 PROCESS_STEP_INDEX = _build_alias_index("process_steps.json")
-PARAMETER_INDEX = _build_alias_index("parameters.json")
 
 
 def resolve_anchor(raw: str, index: dict[str, str]) -> Optional[str]:
     """앵커 표기 하나를 canonical id로. 못 붙이면 None(호출부가 사유를 남기고 버린다)."""
     return index.get(_normalize_key(raw))
+
+
+# =========================
+# 2.2 Parameter 해석은 ProcessStep 조건부다
+# -------------------------
+# 'temperature' 하나가 공정마다 다른 변수를 가리킨다.
+#   LITHO -> stage_temp,  ETCH -> temperature,  DEPO -> susceptor_temp,
+#   CLEAN -> chemical_temp,  EDS -> chuck_temp
+# 전역 사전 하나로는 항상 한쪽으로만 붙어 조용히 틀린다.
+# 그래서 공정별 사전을 따로 만들고, Cause가 속한 공정으로 해석한다.
+#
+# 같은 공정 안에서 한 표현이 두 파라미터를 가리키면 해석이 불가능하다.
+# 그건 시드의 버그이므로 import 시점에 터뜨린다.
+# =========================
+
+def _build_parameter_indexes() -> tuple[dict[str, dict[str, str]], dict[str, set[str]]]:
+    data = json.loads((SEEDS_DIR / "parameters.json").read_text(encoding="utf-8"))
+
+    by_step: dict[str, dict[str, str]] = {step: {} for step in PROCESS_STEP_IDS}
+    steps_of: dict[str, set[str]] = {}
+
+    for node in data["nodes"]:
+        canonical = node["id"]
+        steps_of[canonical] = set(node["steps"])
+        surfaces = {
+            _normalize_key(s)
+            for s in [canonical, node.get("name", canonical), *node.get("aliases", [])]
+        }
+        for step in node["steps"]:
+            for surface in surfaces:
+                clash = by_step[step].get(surface)
+                if clash and clash != canonical:
+                    raise ValueError(
+                        f"parameters.json: 공정 '{step}' 안에서 표현 '{surface}'가 "
+                        f"'{clash}'와 '{canonical}' 둘을 가리킵니다. 별칭을 정리하세요."
+                    )
+                by_step[step][surface] = canonical
+
+    return by_step, steps_of
+
+
+PARAMETER_INDEX_BY_STEP, PARAMETER_STEPS = _build_parameter_indexes()
+
+
+def resolve_parameter(raw: str, steps: set[str]) -> tuple[Optional[str], str]:
+    """
+    Parameter 표기를 canonical id로. steps는 이 Cause가 속한 공정 집합.
+
+    returns (id, reason). 실패하면 id가 None이고 reason에 사유가 담긴다.
+    """
+    key = _normalize_key(raw)
+
+    if not steps:
+        return None, "Cause의 공정을 알 수 없어 Parameter를 해석할 수 없음"
+
+    hits = {
+        PARAMETER_INDEX_BY_STEP[step][key]
+        for step in steps
+        if step in PARAMETER_INDEX_BY_STEP and key in PARAMETER_INDEX_BY_STEP[step]
+    }
+
+    if len(hits) == 1:
+        return hits.pop(), ""
+    if len(hits) > 1:
+        return None, f"공정 {sorted(steps)}에서 '{raw}'가 {sorted(hits)} 여럿을 가리켜 모호함"
+    return None, f"'{raw}'는 공정 {sorted(steps)}에서 계측되지 않는 변수"
 
 
 # canonical ProcessStep id -> 그 공정을 가리키는 모든 표기 (근거 확인용 역방향 맵)
@@ -170,27 +253,44 @@ class CauseNode(BaseModel):
     aliases: list[str] = Field(default_factory=list, description="문헌 속 별칭들")
 
 
-class EquipmentNode(BaseModel):
-    """장비 인스턴스. 문헌이 구체적 장비를 지목할 때만."""
-    id: str = Field(description="장비 식별자. 문헌 표기 그대로. 예: ETCH-03")
-    name: str = Field(description="장비 이름. 보통 id와 같다.")
-    equip_group: ProcessStepId = Field(description="이 장비가 속한 공정군")
+class MaintenanceNode(BaseModel):
+    """
+    정비 행위. 문헌의 '조치(Corrective Action)' 열에서 뽑는다.
+    원인 열에는 'Improper maintenance'라는 뭉뚱그린 표현만 있고,
+    구체적 정비 행위(chamber wet clean 등)는 조치 열에 적혀 있다.
+    """
+    id: str = Field(description="유일 키. 소문자 snake_case. 예: chamber_wet_clean")
+    name: str = Field(description="문헌 표기 그대로. 예: chamber wet clean")
+    description: str = Field(description="완결된 한국어 한 문장")
+
+
+class RecipeNode(BaseModel):
+    """레시피 검증 대상. 예: process recipe."""
+    id: str = Field(description="유일 키. 소문자 snake_case. 예: process_recipe")
+    name: str = Field(description="문헌 표기 그대로. 예: process recipe")
+    description: str = Field(description="완결된 한국어 한 문장")
 
 
 class Relationship(BaseModel):
     """
     kind 별 (source, target) 규약:
-      - ARISES_IN          : DefectPattern id  -> ProcessStep id
-      - OCCURS_IN          : FailureMode id    -> ProcessStep id
-      - CAUSED_BY          : FailureMode id    -> Cause id
-      - INVOLVES_PARAMETER : Cause id          -> Parameter id
+      - ARISES_IN   : DefectPattern id -> ProcessStep id
+      - OCCURS_IN   : FailureMode id   -> ProcessStep id
+      - CAUSED_BY   : FailureMode id   -> Cause id
+      - VERIFIED_BY : Cause id         -> Parameter | Maintenance | Recipe id
+                      (target_label 로 어느 라벨인지 반드시 지목)
     """
     kind: RelationshipKind
     source: str = Field(description="출발 노드의 id")
     target: str = Field(description="도착 노드의 id")
 
+    target_label: Optional[EvidenceLabel] = Field(
+        default=None,
+        description="VERIFIED_BY 전용: 도착 노드의 라벨. 나머지 kind에서는 비워둔다.",
+    )
     direction: Optional[Literal["high", "low"]] = Field(
-        default=None, description="INVOLVES_PARAMETER 전용: 변수 이상 방향"
+        default=None,
+        description="VERIFIED_BY + target_label=Parameter 전용: 변수 이상 방향",
     )
     occurrence_prior: Optional[Literal["high", "mid", "low"]] = Field(
         default=None, description="ARISES_IN 전용: 문헌상 흔한 정도(commonly/rare)"
@@ -203,7 +303,8 @@ class Relationship(BaseModel):
 class RcaGraph(BaseModel):
     failure_modes: list[FailureModeNode]
     causes: list[CauseNode]
-    equipment: list[EquipmentNode]
+    maintenance: list[MaintenanceNode]
+    recipes: list[RecipeNode]
     relationships: list[Relationship]
 
 
@@ -214,7 +315,7 @@ class RcaGraph(BaseModel):
 def build_prompt(chunk: dict) -> str:
     return f"""
 다음은 반도체 웨이퍼 불량 원인분석(RCA) 문헌의 한 조각입니다.
-이 조각에서 고장 모드(FailureMode), 원인(Cause), 장비(Equipment)와 그 관계를 지식그래프로 추출하세요.
+이 조각에서 고장 모드(FailureMode), 원인(Cause), 검증 신호(Evidence)와 그 관계를 지식그래프로 추출하세요.
 
 청크 메타데이터:
 - chunk_id: {chunk['chunk_id']}
@@ -226,10 +327,39 @@ def build_prompt(chunk: dict) -> str:
 - 노드 id는 소문자 snake_case. 예: post_etch_residue, high_etch_rate
 - description은 완결된 한국어 한 문장으로 쓰세요.
 - 공정 변수 자체(rf_power, etch_rate 등)를 Cause로 만들지 마세요.
-  변수는 INVOLVES_PARAMETER의 target으로만 씁니다.
+  변수는 VERIFIED_BY의 target으로만 씁니다.
   "etch rate too high"처럼 이상 방향이 붙은 서술만 Cause입니다.
 - FailureMode(증상/고장 모드)와 Cause(그 배후 원인)를 섞지 마세요.
   예: "excessive post-etch residue"는 FailureMode, "nonuniform etch process"는 Cause.
+- 조치/처방(“~를 교정하라”, “~를 점검하라”)은 Cause가 아닙니다.
+  조치 문장에 등장하는 정비 행위는 Maintenance 노드로만 만드세요.
+
+이 청크가 트러블슈팅 표의 한 행이면 아래 이름표가 붙어 있습니다. 열의 역할이 다릅니다.
+
+  공정: <ProcessStep>        <- 이 행의 OCCURS_IN 대상. 이 공정을 그대로 쓰세요.
+  표 유형: troubleshooting
+  [고장모드]  -> FailureMode 하나
+  [원인]      -> Cause 후보. "A." "B." 처럼 항목이 나뉘어 있으면 **항목마다 Cause 하나**
+  [조치]      -> 조치 문장. **절대 Cause로 만들지 마세요.**
+                 여기 나오는 구체적 정비 행위(chamber wet clean, replace thermocouple 등)만
+                 Maintenance 노드로 만들고, 대응하는 Cause에서 VERIFIED_BY로 연결하세요.
+
+  표 유형: quality
+  [품질항목]  -> 측정 항목. 노드로 만들지 마세요.
+  [결함유형]  -> FailureMode
+  [비고]      -> 원인이 서술돼 있으면 Cause. 조치성 문장("~를 확인하라")은 제외.
+
+  표 유형: pattern_cause     (웨이퍼맵 패턴 -> 원인 직결. 공정 줄이 없습니다)
+  [불량패턴]  -> DefectPattern. 고정 3종에 없으면 이 행은 전부 건너뛰세요.
+  [패턴설명]  -> 노드로 만들지 마세요.
+  [원인]      -> Cause. 쉼표/or 로 나뉜 원인이 여럿이면 **각각 별도 Cause**로 만들고,
+                 DefectPattern에서 ATTRIBUTED_TO로 잇습니다. FailureMode는 만들지 마세요.
+                 원인 문장이 공정을 명시하면(예: "during chemical-mechanical polishing (CMP)")
+                 ARISES_IN도 함께 만드세요.
+
+원인 열의 뭉뚱그린 표현은 이렇게 처리하세요.
+  "Improper maintenance"      -> Cause로 만들고, VERIFIED_BY -> Maintenance (조치 열의 구체 행위)
+  "Incorrect process recipe"  -> Cause로 만들고, VERIFIED_BY -> Recipe ("process recipe")
 
 아래 세 목록은 고정입니다. 새로 만들지 말고 목록 안에서만 고르세요.
 해당하는 항목이 목록에 없으면 그 관계는 추출하지 마세요.
@@ -250,11 +380,31 @@ def build_prompt(chunk: dict) -> str:
   flow_rate, megasonic_power, chemical_temp, rinse_time,
   chuck_temp, contact_resistance
 
-관계(kind) 4종:
-- ARISES_IN:          (DefectPattern) -> (ProcessStep)  "이 불량 패턴은 이 공정을 의심케 한다" (occurrence_prior 채우기)
-- OCCURS_IN:          (FailureMode)   -> (ProcessStep)  "이 고장 모드는 이 공정에서 일어난다" (고장 모드마다 정확히 1개)
-- CAUSED_BY:          (FailureMode)   -> (Cause)        "이 고장 모드의 원인은 저것이다"
-- INVOLVES_PARAMETER: (Cause)         -> (Parameter)    "이 원인은 이 변수의 이상과 얽힌다" (direction 채우기)
+검증 신호(Evidence)는 세 종류이고, Parameter만 위 고정 목록에서 고릅니다.
+Maintenance와 Recipe는 문헌 표현으로 자유롭게 만드세요.
+- Parameter   : 계측 변수. 위 20종 중 하나. (예: rf_power)
+                **어느 변수인지 확실하지 않으면 문헌의 일반 표현을 그대로 쓰세요**
+                (temperature, pressure, gas flow, focus, overlay ...).
+                공정에 맞는 변수로 자동 매핑됩니다. 예: ETCH의 "Incorrect temperature"는
+                'temperature'라고 쓰세요. 'chuck_temp'처럼 다른 공정의 변수를 고르면 버려집니다.
+- Maintenance : 정비 행위. 조치 문장에서 뽑는다. (예: chamber wet clean, replace defective thermocouple)
+- Recipe      : 레시피 확인 대상. (예: process recipe)
+
+관계(kind) 5종:
+- ARISES_IN:     (DefectPattern) -> (ProcessStep)  "이 불량 패턴은 이 공정을 의심케 한다" (occurrence_prior 채우기)
+- ATTRIBUTED_TO: (DefectPattern) -> (Cause)        "이 불량 패턴의 원인은 저것이다"
+                 문헌이 **공정을 말하지 않고** 패턴에서 원인으로 바로 건너뛸 때 씁니다.
+- OCCURS_IN:   (FailureMode)   -> (ProcessStep)  "이 고장 모드는 이 공정에서 일어난다" (고장 모드마다 정확히 1개)
+- CAUSED_BY:   (FailureMode)   -> (Cause)        "이 고장 모드의 원인은 저것이다"
+- VERIFIED_BY: (Cause)         -> (Parameter | Maintenance | Recipe)
+               "이 원인은 이 신호로 검증한다"
+               target_label에 'Parameter' / 'Maintenance' / 'Recipe' 중 하나를 반드시 적으세요.
+               target_label이 'Parameter'일 때만 direction(high/low)을 채우세요.
+
+VERIFIED_BY 대상 고르는 법:
+- 원인이 계측 변수의 이상이면      -> Parameter  (예: "RF power drift" -> rf_power)
+- 원인이 정비 부족/부품 열화면      -> Maintenance (예: "improper maintenance" -> chamber wet clean)
+- 원인이 잘못된 레시피면            -> Recipe     (예: "incorrect process recipe" -> process recipe)
 
 중요:
 - source/target에는 반드시 노드의 id를 쓰세요.
@@ -265,8 +415,15 @@ def build_prompt(chunk: dict) -> str:
 - 불량 패턴(Center/Scratch/Edge-Ring)은 DefectPattern이지 FailureMode가 아닙니다.
   'scratch_pattern' 같은 FailureMode를 만들지 마세요. 패턴은 ARISES_IN의 source로만 씁니다.
   FailureMode는 공정 내부의 고장(post-etch residue, overlay misregistration 등)입니다.
+- 청크가 "웨이퍼맵 상의 어떤 모양이 어느 공정 탓인가"를 서술하면, 그것은 ARISES_IN입니다.
+  그 모양을 FailureMode로 만들지 말고 DefectPattern으로 매핑해 ARISES_IN을 만드세요.
+    "a center often arises due to problems in the thin film deposition"
+        -> ARISES_IN: Center -> DEPO          (O)
+        -> FailureMode 'thin_film_deposition_problem'   (X)
+    "a ring is due to problems in the etching step"      -> ARISES_IN: Edge-Ring -> ETCH
+    "a linear scratch is a result of machine handling"   -> 공정이 명시되지 않았으므로 ARISES_IN 없음
 - 모든 FailureMode에는 OCCURS_IN 관계가 정확히 하나 있어야 합니다.
-- Equipment는 문헌이 "ETCH-03"처럼 구체적 장비를 지목할 때만 만드세요. PART_OF는 만들지 마세요(규칙으로 자동 생성).
+- 장비 인스턴스(ETCH-03 등)는 추출하지 마세요. fab 데이터 영역입니다.
 - 각 관계에 extraction_confidence(1~5)와 근거 quotes를 채우세요.
 
 원문:
@@ -295,8 +452,10 @@ def validate_kg(
     """
     [Graph Pruning]
     - FailureMode/Cause id를 정규화한 뒤 관계의 source/target을 같은 규칙으로 맞춘다.
-    - 앵커(DefectPattern/ProcessStep/Parameter) 표기는 시드 aliases로 canonical id에 갈아끼운다.
+    - 앵커(DefectPattern/ProcessStep) 표기는 시드 aliases로 canonical id에 갈아끼운다.
       LLM이 'edge-ring', 'etching' 처럼 흔들어도 살린다. 못 붙이면 사유를 남기고 버린다.
+    - Parameter는 Cause가 속한 ProcessStep 안에서 해석한다('temperature'가 공정마다 다르므로).
+      그래서 두 패스로 나눈다: 먼저 Cause→공정을 알아낸 뒤에 VERIFIED_BY를 본다.
     - 이번 청크에서 추출되지 않은 FailureMode/Cause를 가리키는 관계는 버린다.
       (없는 노드를 가리키면 Cypher MATCH가 실패해 조용히 유실되므로 미리 자른다)
     - extraction_confidence 2 미만은 폐기.
@@ -305,16 +464,20 @@ def validate_kg(
     """
     log = dropped if dropped is not None else []
 
-    for fm in kg.failure_modes:
-        fm.id = normalize_id(fm.id)
-    for c in kg.causes:
-        c.id = normalize_id(c.id)
+    for node in [*kg.failure_modes, *kg.causes, *kg.maintenance, *kg.recipes]:
+        node.id = normalize_id(node.id)
 
     fm_ids = {fm.id for fm in kg.failure_modes}
     cause_ids = {c.id for c in kg.causes}
+    evidence_ids = {
+        "Maintenance": {m.id for m in kg.maintenance},
+        "Recipe": {r.id for r in kg.recipes},
+    }
 
     valid: list[Relationship] = []
+    deferred: list[Relationship] = []
 
+    # --- 패스 1: 앵커 관계. Cause가 어느 공정에 속하는지도 여기서 알아낸다. ---
     for rel in kg.relationships:
         raw = f"{rel.kind} {rel.source!r} -> {rel.target!r}"
 
@@ -333,23 +496,34 @@ def validate_kg(
             if chunk_text and not step_is_grounded_in(tgt, chunk_text):
                 log.append(f"{raw}: 청크 원문에 공정 '{tgt}' 언급 없음 (환각)")
                 continue
+        elif rel.kind == "ATTRIBUTED_TO":
+            src = resolve_anchor(src, DEFECT_PATTERN_INDEX)
+            tgt = normalize_id(tgt)
+            if src is None:
+                log.append(f"{raw}: DefectPattern 매핑 실패 (고정 3종에 없음)")
+                continue
+            if tgt not in cause_ids:
+                log.append(f"{raw}: Cause가 이 청크에서 추출되지 않음")
+                continue
         elif rel.kind == "OCCURS_IN":
             src = normalize_id(src)
             tgt = resolve_anchor(tgt, PROCESS_STEP_INDEX)
             if src not in fm_ids or tgt is None:
                 log.append(f"{raw}: FailureMode 미추출 또는 ProcessStep 매핑 실패")
                 continue
+            # ARISES_IN과 같은 이유로 근거를 요구한다. 공정 이름이 없는 청크에서
+            # LLM이 아무 공정이나 골라 붙인다(표 청크는 '공정:' 줄이 있어 항상 통과).
+            if chunk_text and not step_is_grounded_in(tgt, chunk_text):
+                log.append(f"{raw}: 청크 원문에 공정 '{tgt}' 언급 없음 (환각)")
+                continue
         elif rel.kind == "CAUSED_BY":
             src, tgt = normalize_id(src), normalize_id(tgt)
             if src not in fm_ids or tgt not in cause_ids:
                 log.append(f"{raw}: FailureMode/Cause가 이 청크에서 추출되지 않음")
                 continue
-        elif rel.kind == "INVOLVES_PARAMETER":
-            src = normalize_id(src)
-            tgt = resolve_anchor(tgt, PARAMETER_INDEX)
-            if src not in cause_ids or tgt is None:
-                log.append(f"{raw}: Cause 미추출 또는 Parameter 매핑 실패")
-                continue
+        elif rel.kind == "VERIFIED_BY":
+            deferred.append(rel)   # 패스 2에서 처리
+            continue
         else:
             log.append(f"{raw}: 알 수 없는 kind")
             continue
@@ -357,22 +531,72 @@ def validate_kg(
         rel.source, rel.target = src, tgt
         valid.append(rel)
 
-    # 어떤 FailureMode도 가리키지 않는 Cause는 그래프에서 도달할 수 없다(고아).
-    # 그 Cause를 버리면 거기서 출발하던 INVOLVES_PARAMETER도 같이 버려야 한다.
-    linked_causes = {r.target for r in valid if r.kind == "CAUSED_BY"}
+    # FailureMode -> 공정, 그리고 Cause -> 공정 (CAUSED_BY를 타고 물려받는다)
+    fm_step = {r.source: r.target for r in valid if r.kind == "OCCURS_IN"}
+    cause_steps: dict[str, set[str]] = {}
+    for r in valid:
+        if r.kind == "CAUSED_BY" and r.source in fm_step:
+            cause_steps.setdefault(r.target, set()).add(fm_step[r.source])
+
+    # --- 패스 2: VERIFIED_BY. Parameter는 Cause의 공정 안에서 해석한다. ---
+    for rel in deferred:
+        raw = f"{rel.kind} {rel.source!r} -> {rel.target!r}"
+
+        src = normalize_id(rel.source.strip())
+        tgt = rel.target.strip()
+
+        if src not in cause_ids:
+            log.append(f"{raw}: Cause가 이 청크에서 추출되지 않음")
+            continue
+        if rel.target_label is None:
+            log.append(f"{raw}: VERIFIED_BY에 target_label이 없음")
+            continue
+
+        if rel.target_label == "Parameter":
+            # 고정 vocabulary. Cause가 속한 공정 안에서만 별칭을 푼다.
+            tgt, reason = resolve_parameter(tgt, cause_steps.get(src, set()))
+            if tgt is None:
+                log.append(f"{raw}: {reason}")
+                continue
+        else:
+            # Maintenance / Recipe 는 문서에서 자유 추출. 같은 청크에 노드가 있어야 한다.
+            tgt = normalize_id(tgt)
+            if tgt not in evidence_ids[rel.target_label]:
+                log.append(f"{raw}: {rel.target_label} 노드가 이 청크에서 추출되지 않음")
+                continue
+            # direction은 Parameter 전용이다. 나머지에 붙어 오면 버린다.
+            rel.direction = None
+
+        rel.source, rel.target = src, tgt
+        valid.append(rel)
+
+    # 어디에서도 가리켜지지 않는 Cause는 그래프에서 도달할 수 없다(고아).
+    # FailureMode를 거치거나(CAUSED_BY), DefectPattern이 직접 지목하면(ATTRIBUTED_TO) 살아남는다.
+    # 그 Cause를 버리면 거기서 출발하던 VERIFIED_BY도 같이 버려야 한다.
+    linked_causes = {
+        r.target for r in valid if r.kind in ("CAUSED_BY", "ATTRIBUTED_TO")
+    }
     for c in kg.causes:
         if c.id not in linked_causes:
-            log.append(f"Cause {c.id!r}: 어떤 FailureMode도 가리키지 않는 고아")
+            log.append(f"Cause {c.id!r}: FailureMode/DefectPattern 어느 쪽도 가리키지 않는 고아")
     causes = [c for c in kg.causes if c.id in linked_causes]
     valid = [
         r for r in valid
-        if r.kind != "INVOLVES_PARAMETER" or r.source in linked_causes
+        if r.kind != "VERIFIED_BY" or r.source in linked_causes
     ]
+
+    # 살아남은 VERIFIED_BY가 가리키지 않는 evidence 노드도 고아라 저장하지 않는다.
+    used = {
+        (r.target_label, r.target) for r in valid if r.kind == "VERIFIED_BY"
+    }
+    maintenance = [m for m in kg.maintenance if ("Maintenance", m.id) in used]
+    recipes = [r for r in kg.recipes if ("Recipe", r.id) in used]
 
     return RcaGraph(
         failure_modes=kg.failure_modes,
         causes=causes,
-        equipment=kg.equipment,
+        maintenance=maintenance,
+        recipes=recipes,
         relationships=valid,
     )
 
@@ -402,7 +626,8 @@ _CHUNK_IDS_SET = """
 def save_kg_to_neo4j(graph: Neo4jGraph, kg: RcaGraph, chunk: dict) -> None:
     failure_modes = [n.model_dump() for n in kg.failure_modes]
     causes = [n.model_dump() for n in kg.causes]
-    equipment = [n.model_dump() for n in kg.equipment]
+    maintenance = [n.model_dump() for n in kg.maintenance]
+    recipes = [n.model_dump() for n in kg.recipes]
     rels = [r.model_dump() for r in kg.relationships]
 
     chunk_id = chunk["chunk_id"]
@@ -437,21 +662,44 @@ def save_kg_to_neo4j(graph: Neo4jGraph, kg: RcaGraph, chunk: dict) -> None:
             params={"chunk_id": chunk_id, "nodes": causes},
         )
 
-    # (3) Equipment 노드 + PART_OF (equip_group에서 규칙으로 파생)
-    if equipment:
+    # (3) Maintenance / Recipe evidence 노드
+    #     :Evidence 슈퍼라벨을 함께 붙여, "이 Cause의 모든 검증 신호"를 한 번에 조회 가능하게 한다.
+    if maintenance:
         graph.query(
             """
             MATCH (c:Chunk {id: $chunk_id})
             UNWIND $nodes AS n
-            MERGE (e:Equipment {id: n.id})
-            SET e.name = n.name,
-                e.equip_group = n.equip_group
-            MERGE (c)-[:MENTIONS]->(e)
-            WITH e, n
-            MATCH (s:ProcessStep {id: n.equip_group})
-            MERGE (e)-[:PART_OF]->(s)
+            MERGE (m:Maintenance {id: n.id})
+            SET m:Evidence,
+                m.name = n.name,
+                m.description = n.description,
+                m.fab_table = $fab_table
+            MERGE (c)-[:MENTIONS]->(m)
             """,
-            params={"chunk_id": chunk_id, "nodes": equipment},
+            params={
+                "chunk_id": chunk_id,
+                "nodes": maintenance,
+                "fab_table": FAB_TABLE["Maintenance"],
+            },
+        )
+
+    if recipes:
+        graph.query(
+            """
+            MATCH (c:Chunk {id: $chunk_id})
+            UNWIND $nodes AS n
+            MERGE (rc:Recipe {id: n.id})
+            SET rc:Evidence,
+                rc.name = n.name,
+                rc.description = n.description,
+                rc.fab_table = $fab_table
+            MERGE (c)-[:MENTIONS]->(rc)
+            """,
+            params={
+                "chunk_id": chunk_id,
+                "nodes": recipes,
+                "fab_table": FAB_TABLE["Recipe"],
+            },
         )
 
     if not rels:
@@ -467,6 +715,22 @@ def save_kg_to_neo4j(graph: Neo4jGraph, kg: RcaGraph, chunk: dict) -> None:
         MERGE (p)-[rel:ARISES_IN]->(s)
         SET rel.occurrence_prior = r.occurrence_prior,
             rel.extraction_confidence = r.extraction_confidence,
+            rel.description = r.description,
+            rel.quotes = r.quotes,
+        {_CHUNK_IDS_SET}
+        """,
+        params={"rels": rels, "chunk_id": chunk_id},
+    )
+
+    # (4b) ATTRIBUTED_TO : DefectPattern -> Cause  (문서 C, 공정을 거치지 않는 직결)
+    graph.query(
+        f"""
+        UNWIND $rels AS r
+        WITH r WHERE r.kind = 'ATTRIBUTED_TO'
+        MATCH (p:DefectPattern {{id: r.source}})
+        MATCH (c:Cause {{id: r.target}})
+        MERGE (p)-[rel:ATTRIBUTED_TO]->(c)
+        SET rel.extraction_confidence = r.extraction_confidence,
             rel.description = r.description,
             rel.quotes = r.quotes,
         {_CHUNK_IDS_SET}
@@ -506,22 +770,25 @@ def save_kg_to_neo4j(graph: Neo4jGraph, kg: RcaGraph, chunk: dict) -> None:
         params={"rels": rels, "chunk_id": chunk_id},
     )
 
-    # (7) INVOLVES_PARAMETER : Cause -> Parameter  (검증 종착점, direction)
-    graph.query(
-        f"""
-        UNWIND $rels AS r
-        WITH r WHERE r.kind = 'INVOLVES_PARAMETER'
-        MATCH (c:Cause {{id: r.source}})
-        MATCH (p:Parameter {{id: r.target}})
-        MERGE (c)-[rel:INVOLVES_PARAMETER]->(p)
-        SET rel.direction = r.direction,
-            rel.extraction_confidence = r.extraction_confidence,
-            rel.description = r.description,
-            rel.quotes = r.quotes,
-        {_CHUNK_IDS_SET}
-        """,
-        params={"rels": rels, "chunk_id": chunk_id},
-    )
+    # (7) VERIFIED_BY : Cause -> Parameter | Maintenance | Recipe  (검증 종착점)
+    #     Cypher는 라벨을 파라미터로 못 받는다. target_label 별로 쿼리를 나눈다.
+    for label in FAB_TABLE:
+        graph.query(
+            f"""
+            UNWIND $rels AS r
+            WITH r WHERE r.kind = 'VERIFIED_BY' AND r.target_label = $label
+            MATCH (c:Cause {{id: r.source}})
+            MATCH (e:{label} {{id: r.target}})
+            MERGE (c)-[rel:VERIFIED_BY]->(e)
+            SET rel.target_label = r.target_label,
+                rel.direction = r.direction,
+                rel.extraction_confidence = r.extraction_confidence,
+                rel.description = r.description,
+                rel.quotes = r.quotes,
+            {_CHUNK_IDS_SET}
+            """,
+            params={"rels": rels, "chunk_id": chunk_id, "label": label},
+        )
 
 
 # =========================
@@ -579,7 +846,10 @@ def main() -> None:
     if OUTPUT_PATH.exists():
         OUTPUT_PATH.unlink()
 
-    totals = {"failure_modes": 0, "causes": 0, "equipment": 0, "relationships": 0}
+    totals = {
+        "failure_modes": 0, "causes": 0,
+        "maintenance": 0, "recipes": 0, "relationships": 0,
+    }
     total_dropped = 0
 
     for i, chunk in enumerate(chunks, start=1):
@@ -595,7 +865,8 @@ def main() -> None:
         print(
             "FailureMode:", len(kg.failure_modes),
             "| Cause:", len(kg.causes),
-            "| Equipment:", len(kg.equipment),
+            "| Maintenance:", len(kg.maintenance),
+            "| Recipe:", len(kg.recipes),
             "| 관계:", len(kg.relationships),
         )
         for reason in dropped:
@@ -607,7 +878,8 @@ def main() -> None:
 
         totals["failure_modes"] += len(kg.failure_modes)
         totals["causes"] += len(kg.causes)
-        totals["equipment"] += len(kg.equipment)
+        totals["maintenance"] += len(kg.maintenance)
+        totals["recipes"] += len(kg.recipes)
         totals["relationships"] += len(kg.relationships)
 
     graph.refresh_schema()

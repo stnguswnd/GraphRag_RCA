@@ -16,7 +16,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 BASE_DIR = Path(__file__).resolve().parent          # 프로젝트 루트
 
-DOCS_DIR = BASE_DIR / "data" / "docs"
+# 원문 문헌. 하위 디렉토리(_reference/)는 읽지 않는다 — 교과서 본문을 거기 넣어 뒀다.
+# 본문 339KB는 물리 이론 서술이라 RCA 노이즈만 늘리고, 인과 서술은
+# _troubleshootingTABLE.md 에 100% 옮겨져 있다.
+DOCS_DIR = BASE_DIR / "data" / "raw"
 OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_PATH = OUTPUT_DIR / "parsed_docs.jsonl"
 
@@ -56,7 +59,7 @@ def clean_text(text: str) -> str:
 # 내용이 빈 파일은 건너뛴다.
 # =========================
 
-TEXT_SUFFIXES = {"", ".txt"}
+TEXT_SUFFIXES = {"", ".txt", ".md"}
 
 
 def load_txt_documents(docs_dir: Path) -> list[Document]:

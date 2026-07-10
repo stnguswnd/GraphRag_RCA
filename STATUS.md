@@ -1,108 +1,163 @@
 # RCA GraphRAG 파이프라인 — 진행 상황 & 남은 문제
 
 > 마지막 업데이트: 2026-07-10
-> 웨이퍼맵 불량 원인분석(RCA) 지식그래프 파이프라인. **스키마 원본은 `schema.md`.**
+> 웨이퍼맵 불량 원인분석(RCA) 지식그래프 파이프라인. **스키마 정본은 `schema_v2.md` (v2.2).**
+> `schema.md`는 v1 기록용. 옛 Text2Cypher 질의 코드는 `6_ask_graphrag_backup.py`.
 
 ---
 
 ## 1. 현재 상태 (요약)
 
-`.txt` 문헌 → 청킹 → Neo4j 적재 → LLM KG 추출 → GraphRAG 질의응답.
-
-**2026-07-10: 전체 코드를 `schema.md` 백본으로 재작성함.** 아래 5종 관계가 정본이다.
-
 ```
-DefectPattern ──ARISES_IN──> ProcessStep <──OCCURS_IN── FailureMode
-                              (join)                        │ CAUSED_BY
-Equipment ──PART_OF────────> ProcessStep                    ▼
-                                                          Cause ──INVOLVES_PARAMETER──> Parameter
-                                                                                    (→ fab SQL)
+data/raw/ 문헌 → 표 행 단위 청킹 → Neo4j 적재 → LLM KG 추출(+검증 규칙) → 결정적 순회 + LLM 문장 합성
 ```
 
-이전 스키마에서 바뀐 점:
-- `FailureMode`, `Equipment`, `Parameter` 노드 신설 / `ParameterType` → `Parameter` 대체
-- `ARISES_IN`, `PART_OF` 관계 신설
-- `OCCURS_IN` 소스가 `Cause` → `FailureMode`, `CAUSED_BY`가 `Cause→Cause` → `FailureMode→Cause`
-- `MANIFESTS_AS`, `DetectionMethod`, `DETECTED_BY`, `cause_type`(5M) **제거**
-- 모든 노드의 유일 키를 `name`/`uid` → **`id`** 로 통일
-- `DefectPattern` 9종 → **3종** (Center / Scratch / Edge-Ring)
-- `Parameter` 20종을 **`fab.md`의 장비군별 파라미터**로 교체 (join key: `telemetry.param`)
+**전 단계 실행 검증 완료.** 최신 실행 수치 (문헌 5편 → 청크 95개):
 
-**2026-07-10: 보험(PDF 약관) 파이프라인을 전부 제거하고 RCA 전용 저장소로 정리함.**
-`rca/` 하위에 있던 코드를 루트로 승격했고, `data/rca_mock/` → `data/`,
-목업 문서는 스키마에 정확히 대응하는 `doc_A`~`doc_D` 4편만 남겼다.
+| | |
+|---|---|
+| 노드 | FailureMode 103 · Cause 217 · Maintenance 106 · Recipe 20 (+시드: DefectPattern 3 · ProcessStep 6 · Parameter 20) |
+| 관계 | CAUSED_BY 210 · VERIFIED_BY 143 · OCCURS_IN 90 · ATTRIBUTED_TO 12 · ARISES_IN 3 |
+| 가설 | **총 125건** — Center 62 (자동14/반자동44/근거없음4) · Edge-Ring 53 (3/45/5) · Scratch 10 (0/7/3) |
 
-**0~4단계 실행 검증 완료** (문헌 4편 → 청크 11개, 시드 3/6/20 적재, 잔재 라벨 0).
-5~6단계는 OpenAI 호출이라 미실행.
+질문은 `"{패턴} 결함 패턴이 나타나는 근본 원인은 무엇인가요?"` 하나로 고정.
+그래프 순회는 고정 Cypher(결정적), LLM은 경로를 한국어 가설 문장으로 옮기는 역할만.
+
+**가설이 125건인 이유 (설계 의도):** 경로 수 = 각 홉 팬아웃의 곱
+(`패턴 → 공정 1~2 × 공정당 FailureMode 8~37 × FM당 Cause ~2 × Cause당 Evidence ~1.4`).
+`ProcessStep` join에는 의미 필터가 없어서, 의심 공정의 **모든** 고장 모드가 후보가 된다
+(막 균열이 Center 후보로 올라오는 이유). recall을 취하고 precision은 fab 검증에 미루는 설계.
 
 ---
 
 ## 2. 파일 구조
 
 ### 데이터 (`data/`)
-- `docs/` — 문헌 4편
-  - `doc_A_wafermap_patterns.txt` — 패턴 → 공정 (`ARISES_IN`)
-  - `doc_B/C/D_*_troubleshooting.txt` — 고장 모드 → 원인 → 변수 (ETCH/DEPO/CMP)
-- `seeds/defect_patterns.json` — 불량 패턴 **3종** (VLM 출력 클래스와 동일해야 함)
-- `seeds/process_steps.json` — 공정 6종 (join key: `lot_history.step`)
-- `seeds/parameters.json` — 공정 변수 20종 (join key: `telemetry.param`, `fab.md` 기준)
+- `raw/` — 실문헌 5편 (파이프라인 입력)
+  - `center_pattern_cause.txt`, `pattern_cause`, `scratch_pattern_cause` — 문서 A (패턴→공정 산문)
+  - `Semiconductor Devices..._troubleshootingTABLE.md` — 문서 B (교과서 트러블슈팅 표 82행, DEPO/LITHO/ETCH/CMP)
+  - `ref56_table1_pattern_causes.md` — 문서 C (ref56 논문 Table 1, 패턴→원인 직결)
+  - `_reference/` — 교과서 본문 339KB. **로더가 읽지 않음** (하위 디렉토리 제외)
+- `seeds/` — 고정 vocabulary 3종
+  - `defect_patterns.json` (3종, VLM 출력 클래스와 동일해야 함)
+  - `process_steps.json` (6종, join key: `lot_history.step`)
+  - `parameters.json` (20종, join key: `telemetry.param`, `steps` 필드가 별칭 해석 스코프)
 
 ### 파이프라인 코드 (루트)
-- `0_reset.py` — Neo4j DB 전체 초기화 (노드/관계/제약/인덱스)
-- `1_test_connection.py` — Neo4j 연결 확인
-- `2_load_txt.py` — 문헌 로드 → `outputs/parsed_docs.jsonl`
-- `3_split.py` — 청킹 → `outputs/chunks.jsonl` (chunk_id = `{doc_id}#c{nn}`)
-- `4_ingest_chunks_to_neo4j.py` — 시드 앵커 3종 적재 + Chunk 적재 + NEXT_CHUNK
-- `5_build_kg_from_chunks.py` — LLM으로 FailureMode/Cause/Equipment + 4종 관계 추출, PART_OF는 규칙
-- `6_ask_graphrag.py` — GraphCypherQAChain 질의응답
-
-실행 순서는 `README.md` 참조.
-
-> `0_reset.py`를 건너뛰고 스키마를 바꾸면 `id` 없는 옛 앵커 노드가 남아 **중복 노드**가 생긴다.
-> Neo4j의 UNIQUE 제약은 null을 무시하므로 `MERGE {id: ...}`가 옛 노드를 못 찾는다.
+- `0_reset.py` — Neo4j DB 전체 초기화 (스키마 변경 후 필수)
+- `1_test_connection.py` — 연결 확인
+- `2_load_txt.py` — `data/raw/` 로드 (.txt/.md/무확장자, 빈 파일·하위 디렉토리 제외)
+- `3_split.py` — 표 행 단위 청킹 (표 유형 3종 판별: troubleshooting/quality/pattern_cause) + 산문 재귀 분할
+- `4_ingest_chunks_to_neo4j.py` — 제약 + 시드 앵커(:Evidence 슈퍼라벨 포함) + Document/Chunk
+- `5_build_kg_from_chunks.py` — LLM 추출 + 검증 규칙 6종(`schema_v2.md` 참조) + 저장
+- `6_ask_graphrag.py` — 패턴별 가설 전건 출력 (`TOP_K` 환경변수로 상한 조절 가능)
 
 ---
 
-## 3. 남은 문제 (우선순위 순)
+## 3. 작업 로그 (2026-07-10, 시간순 압축)
 
-### [P1] 5~6단계 재작성 후 미실행 — 검증 필요
-- 0~4단계는 실제로 돌렸다. 5~6단계는 가지치기/프롬프트 렌더링 로직만 단위 확인.
-- **할 일**: `5` → `6`을 돌려 관계 개수와 질의 정답률 확인.
-
-### [P2] 추출 품질 — ARISES_IN 누락, Equipment 오추출
-문서 정리 **이전**(문헌 11편) 실행 결과에서 관찰된 것:
-- **ARISES_IN이 2건만 추출됨** (`Edge-Ring→ETCH`, `Center→DEPO`).
-  당시 `doc_A`에 명시된 `Edge-Ring→DEPO`, `Donut→CMP`가 누락.
-- **Equipment 오추출**: `depo_01`, `deposition_tool`, `etch_chamber`, `exposure_tool` 등
-  장비 인스턴스가 아닌 것들이 노드가 됨. `ETCH-03`, `CMP-01`만 유효.
-- **Cause 56개 / FailureMode 41개** — 과다 추출.
-- 노이즈의 상당 부분은 내용이 겹치던 옛 목업 문서 7편에서 나왔고, 그 문서들은 삭제했다.
-  **문서 정리 후 재실행해서 얼마나 개선됐는지 먼저 확인할 것.**
-- 남은 해결안: Equipment id 형식 검증(`^[A-Z]+-\d+$`), 임베딩 기반 dedup / entity resolution.
-
-### [P3] FailureMode id가 공정 스코프를 갖지 않음
-- `schema.md`의 예시를 따라 `FailureMode.id`를 맨 이름(`post_etch_residue`)으로 뒀다.
-- 그래서 ETCH의 "particle contamination"과 CLEAN의 "particle contamination"이 **한 노드로 병합**되고,
-  `OCCURS_IN`이 두 공정을 가리키게 된다.
-- 의도한 동작이 아니면 `{STEP}:{name}` 형태로 바꿔야 한다. **미결정.**
+1. **v1 → v2.1**: `Equipment`/`PART_OF` 제거, `INVOLVES_PARAMETER` → **`VERIFIED_BY`** 다형화
+   (`Parameter`/`Maintenance`/`Recipe`, `:Evidence` 슈퍼라벨). v1에서 고아로 버려지던
+   `improper maintenance`·`incorrect process recipe` 원인이 검증 종착점을 얻음.
+2. **Parameter 해석을 ProcessStep 조건부로**: `temperature`가 공정마다 다른 변수
+   (LITHO `stage_temp` / ETCH `temperature` / DEPO `susceptor_temp` / CLEAN `chemical_temp` / EDS `chuck_temp`).
+   `validate_kg`를 두 패스로 분리(Cause→공정 파악 후 Parameter 해석). 공정-변수 불일치 0건 확인.
+3. **문서 소스를 `data/raw/`로 전환**: 표 행 단위 청커(행=청크, 열 역할 이름표),
+   교과서 본문 제외, `OCCURS_IN` grounding 가드 추가, 산문 DefectPattern 인식 개선.
+4. **`ATTRIBUTED_TO` 신설 (v2.2)**: ref56 Table 1(패턴→원인 직결, 공정 미상)을 담는 엣지.
+   Scratch 행이 CMP를 명시해 `ARISES_IN: Scratch→CMP`도 정당하게 성립 → Scratch 가설 0건 문제 해소.
+5. **검증 등급 3단**: `[자동]`(Parameter, agent가 판정) / `[반자동]`(Maintenance·Recipe,
+   agent 조회+사람 판정) / `[근거없음]`(evidence 없는 문헌 직결). 축은 "fab.db에 있느냐"가
+   아니라 **"agent가 스스로 판정할 수 있느냐"**.
+6. **출력 상한 제거**: `TOP_K=3` 삭제(환경변수로만 조절). dedup 키를 전체 경로로 교정해
+   뭉개지던 15건 복원. 문장 합성을 배치(12건)로 나누고 부족분은 사실 기반 문장으로 채움 → 125건 전부 출력.
 
 ---
 
-## 4. 아직 구현 안 한 것
+## 4. 남은 문제
 
-- **`Hypothesis` 투영 노드** — `DefectPattern → ProcessStep → FailureMode → Cause → Parameter`
-  경로 하나하나가 가설 1건. 이를 평탄화한 노드/뷰는 미구현.
-- **fab SQL 검증 연결** — `Parameter.id` ↔ `telemetry.param` join은 스키마상 준비됐으나
-  실제 조회 코드는 없음.
-- **anneal(RTA) 스코프** — 문서 A가 RTA를 언급하나 fab 6스텝 밖. 포함 여부 미결정.
-- **VLM 관측 입력 처리** — 현재 6번은 자연어 질문 입력.
+### [P1] 검증 신호가 `Maintenance`로 쏠림 (143건 중 Maintenance 110 : Recipe 17 : Parameter 16)
+- `[원인] A. Change in RF power`가 `Parameter rf_power`로 가야 하는데, LLM이 조치 열의
+  `Check RF generator`를 보고 `Maintenance`로 붙이는 추출 편향.
+- `[자동]` 가설이 그만큼 희소해짐 (Edge-Ring 53건 중 자동 3건뿐).
+- **해결안**: 프롬프트에 우선순위 명시 — "원인이 계측 변수의 이상이면 반드시 Parameter 우선,
+  Maintenance는 원인이 정비 그 자체일 때만".
+
+### [P2] 가설 점수 체계가 타당성이 없음 — 재설계 필요
+현재 점수 = `(검증등급, occurrence_prior, confidence평균)` 튜플 내림차순. **믿을 만한 성분이
+검증등급 하나뿐**이고, 그마저 "확인하기 쉬운 순서"이지 "그럴듯한 순서"가 아니다.
+
+무엇이 잘못됐나:
+- **뒤 두 성분은 LLM 자기평가다.** 계산도 통계도 아니고, 근거 수·교차검증이 반영되지 않는다.
+  실측상 거의 전부 `5.0`/`high` 동점이라 같은 등급 안 순서는 Neo4j 반환 순서에 가깝다.
+- **평균이 약한 고리를 감춘다.** `(5,5,2)` 경로와 `(4,4,4)` 경로가 똑같이 4.0.
+  인과 사슬은 가장 약한 고리만큼만 믿을 수 있으므로 최솟값이 맞다.
+- **경로 4개 관계 중 3개만 집계.** `OCCURS_IN`의 confidence가 점수에 안 들어간다.
+- **근거의 양이 무시된다.** 문서 세 곳이 말하는 원인과 한 문장이 스친 원인이 같은 점수.
+  `chunk_ids`로 기록은 하면서 쓰지 않는다.
+- **저장 버그가 점수를 오염시킨다.** 같은 관계가 여러 청크에서 나오면 `SET`이 confidence를
+  마지막 값으로 덮어쓴다 (chunk_ids는 누적되는데 confidence는 아님) → 처리 순서에 따라 점수가 달라짐.
+- **`coalesce(..., 3)`이 결측을 "보통 신뢰도"로 둔갑시킨다.**
+
+재설계 방향 (→ Next Action Steps ③):
+1. confidence: 평균 → **경로 최솟값**, `OCCURS_IN` 포함, 저장 시 `max()` 유지, coalesce 제거
+2. **근거 강도**를 독립 성분으로: 근거 청크 수 + 출처 문서 다양성 (같은 문서 반복 < 서로 다른 문서)
+3. 결정적 tiebreak (이름순) — 실행마다 순서가 바뀌지 않게
+4. 장기적으로는 **fab 검증 결과가 사후 점수(posterior)** — 채택/기각 이력이 쌓이면
+   그것이 진짜 순위이고, 문헌 기반 점수는 prior 역할로 물러난다 (②의 Hypothesis 노드와 연결)
+
+### [P3] Maintenance 노드 과다 + 미중복제거 (106개)
+- `chamber_wet_clean`처럼 유의미한 것과 `inspect_whether_residual_copper_cleaning_finished...`
+  같은 일회성 장문 표현이 섞임. 임베딩 기반 dedup / 정규화 필요.
+
+### [P4] 추출 비결정성
+- 같은 청크에서 실행마다 결과가 다름. `Edge-Ring→DEPO`가 어떤 실행에선 나오고 어떤 실행에선 빠짐
+  (`temperature=0`으로도 안 잡힘). 다회 실행 합집합 또는 seed 고정 검토.
+
+### [P5] 커버리지 공백
+- `CLEAN`/`EDS`: 트러블슈팅 문헌 없음 (결정: 빈 공정으로 두고 문서 추가 예정).
+- ref56 Table 1의 5개 패턴(`Donut`, `Edge-Loc`, `Loc`, `Near-Full`, `Random`)은 고정 3종 밖이라 버려짐.
+  VLM 클래스를 9종으로 늘리면 그대로 살아남는 구조.
+- 표에 있으나 fab에 없는 변수(`gas flow @ ETCH`, `film stress` 등)는 옳게 버려지지만 가설도 줄어듦.
+
+### [P6] ProcessStep join에 의미 필터 없음
+- 의심 공정의 모든 고장 모드가 패턴의 후보가 됨 (Center에 막 균열이 1순위로 올라옴).
+- 설계 의도(recall 우선)이나, 노이즈가 크면 `FailureMode`에 공간 시그니처 속성을 붙이거나
+  LLM 재랭킹을 얹는 방안 검토.
+
 
 ---
 
-## 5. 다음에 할 일 후보 (사용자 선택 대기)
+## 5. Next Action Steps
 
-1. `5` → `6` 실행 + 정리된 문서에서 ARISES_IN 4건이 다 나오는지 확인 (P1, P2)
-2. Equipment id 검증 / 추출 dedup 단계 추가 (P2)
-3. `FailureMode.id` 공정 스코프 결정 (P3)
-4. `Hypothesis` 투영 단계 구현
-5. fab SQL 검증 경로 연결
+### ① `6_ask_graphrag.py` 출력에 메타정보·로그 구조 추가 ← **일부 완료**
+- **완료:** 사람용 stdout과 병행해 **`outputs/hypotheses.json`** 저장 (가설 125건 확인).
+  구조: `meta`(생성 시각, 모델, DB, TOP_K, 등급 범례, 점수 주의문) +
+  `questions[]`(패턴별 counts) + `hypotheses[]`(rank / sentence / tier / route /
+  path{step, failure_mode, cause, evidence, evidence_label} / verification{fab_table, direction} /
+  score{tier, occurrence_prior, confidence} / detail / **provenance{chunk_ids, quotes}**).
+  `[근거없음]`은 `evidence: null`, `fab_table: null`로 명시.
+- **남음:** 실행 로그(5번의 버림 사유, 6번의 배치 경고)를 파일로 남기는 부분.
+  그래프 스냅샷 수치(라벨/관계 카운트)를 meta에 포함할지도 ②에서 결정.
+
+### ② hypothesis agent와의 연결고리 설계 ← **다음 작업**
+- `[자동]` 가설: `Parameter.id` + `direction` + lot_id → `lot_history`로 equipment_id/ts 바인딩
+  → `telemetry` 조회 → `fab_model.yaml` 정상범위 비교 → 채택/기각. **agent가 끝까지.**
+- `[반자동]` 가설: agent가 `maintenance`/`lot_history` 조회 결과를 첨부해 사람에게 전달.
+- 인터페이스 결정 필요: ①의 jsonl을 agent 입력으로 쓸지, agent가 Neo4j를 직접 순회할지.
+- `Hypothesis` 투영 노드(경로를 평탄화한 노드로 굳혀 검증 결과를 기록할 자리)를 만들지 여부도
+  이때 함께 결정하는 게 자연스러움.
+
+### ③ 가설 점수 체계 재설계 (P2) ← **다음 작업**
+현행 점수는 검증등급 외에는 순위 근거가 없다 (상세는 P2).
+- 단기: min-confidence(OCCURS_IN 포함) + 근거 청크 수·문서 다양성 + 결정적 tiebreak
+  + 저장 시 confidence `max()` 유지. 전부 `6_ask_graphrag.py`/`5번` 소폭 수정으로 가능.
+- 장기: fab 검증 채택/기각 이력을 사후 점수로 (②의 `Hypothesis` 노드에 기록 → 문헌 점수는 prior).
+- ①의 jsonl에 점수 성분을 분해해서 담아야 agent와 사람이 순위 근거를 검산할 수 있다.
+
+### ④ 그 외 후보 (우선순위 낮음, P1·P3~P6 대응)
+1. Maintenance 편향 프롬프트 수정 (P1) — `[자동]` 가설을 늘리는 가장 싼 수
+2. Maintenance dedup (P3)
+3. CLEAN/EDS 트러블슈팅 문서 추가 (P5)
+4. DefectPattern 9종 확장 — VLM 클래스와 정렬 (P5)
+5. VLM 관측 입력(JSON) 처리 — 현재는 고정 질문 3개 순회

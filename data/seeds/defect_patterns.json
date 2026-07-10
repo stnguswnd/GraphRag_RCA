@@ -4,7 +4,7 @@
     {
       "id": "Center",
       "name": "Center",
-      "aliases": ["center defect", "center cluster", "bullseye center", "bulls eye", "wafer center"],
+      "aliases": ["center defect", "center cluster", "bullseye center", "bulls eye", "bullseye", "wafer center", "center pattern"],
       "spatial_keywords": ["center", "middle", "core"],
       "expected_zone": ["center"],
       "expected_shape": ["blob", "cluster"]
@@ -12,7 +12,7 @@
     {
       "id": "Scratch",
       "name": "Scratch",
-      "aliases": ["scratch defect", "scuff mark", "surface scratch"],
+      "aliases": ["scratch defect", "scuff mark", "surface scratch", "linear scratch", "scratch pattern"],
       "spatial_keywords": ["scratch", "scuff", "surface"],
       "expected_zone": ["mid"],
       "expected_shape": ["line", "elongated"]
@@ -20,7 +20,7 @@
     {
       "id": "Edge-Ring",
       "name": "Edge-Ring",
-      "aliases": ["edge ring defect", "edge ring", "peripheral ring", "outer ring", "circular ring", "엣지링"],
+      "aliases": ["edge ring defect", "edge ring", "peripheral ring", "outer ring", "circular ring", "ring", "엣지링"],
       "spatial_keywords": ["edge", "ring", "peripheral", "omni"],
       "expected_zone": ["edge"],
       "expected_shape": ["ring"]

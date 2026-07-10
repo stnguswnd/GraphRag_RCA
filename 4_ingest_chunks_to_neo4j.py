@@ -52,10 +52,12 @@ def create_constraints(graph: Neo4jGraph) -> None:
     statements = [
         "CREATE CONSTRAINT defect_pattern_id IF NOT EXISTS FOR (n:DefectPattern) REQUIRE n.id IS UNIQUE",
         "CREATE CONSTRAINT process_step_id   IF NOT EXISTS FOR (n:ProcessStep)   REQUIRE n.id IS UNIQUE",
-        "CREATE CONSTRAINT parameter_id      IF NOT EXISTS FOR (n:Parameter)     REQUIRE n.id IS UNIQUE",
         "CREATE CONSTRAINT failure_mode_id   IF NOT EXISTS FOR (n:FailureMode)   REQUIRE n.id IS UNIQUE",
         "CREATE CONSTRAINT cause_id          IF NOT EXISTS FOR (n:Cause)         REQUIRE n.id IS UNIQUE",
-        "CREATE CONSTRAINT equipment_id      IF NOT EXISTS FOR (n:Equipment)     REQUIRE n.id IS UNIQUE",
+        # evidence 3종 (공통 슈퍼라벨 :Evidence 를 함께 갖는다)
+        "CREATE CONSTRAINT parameter_id      IF NOT EXISTS FOR (n:Parameter)     REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT maintenance_id    IF NOT EXISTS FOR (n:Maintenance)   REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT recipe_id         IF NOT EXISTS FOR (n:Recipe)        REQUIRE n.id IS UNIQUE",
         "CREATE CONSTRAINT chunk_id_unique    IF NOT EXISTS FOR (c:Chunk)    REQUIRE c.id IS UNIQUE",
         "CREATE CONSTRAINT document_id_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
     ]
@@ -112,14 +114,21 @@ def seed_process_steps(graph: Neo4jGraph) -> None:
 
 
 def seed_parameters(graph: Neo4jGraph) -> None:
+    """
+    Parameter만 evidence 중 유일하게 고정 vocabulary다.
+    id가 fab telemetry.param 과 문자열이 일치해야 검증 SQL이 붙기 때문.
+    Maintenance/Recipe 는 문서에서 추출되므로 시드하지 않는다(5번이 만든다).
+    """
     nodes = load_seed("parameters.json")
     graph.query(
         """
         UNWIND $nodes AS n
         MERGE (p:Parameter {id: n.id})
-        SET p.name = n.name,
+        SET p:Evidence,
+            p.name = n.name,
             p.steps = n.steps,
-            p.aliases = n.aliases
+            p.aliases = n.aliases,
+            p.fab_table = 'telemetry'
         """,
         params={"nodes": nodes},
     )
