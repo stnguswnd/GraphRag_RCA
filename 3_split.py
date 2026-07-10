@@ -1,9 +1,12 @@
+import sys
 import json
-import hashlib
 from pathlib import Path
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# Windows 콘솔(cp949)에서 em-dash 등 유니코드 출력 시 크래시 방지
+sys.stdout.reconfigure(encoding="utf-8")
 
 
 # =========================
@@ -17,13 +20,12 @@ OUTPUT_PATH = BASE_DIR / "outputs" / "chunks.jsonl"
 
 
 # =========================
-# 2. JSONL 로드
+# 2. parsed_docs.jsonl 로드
 # =========================
 
 def load_parsed_documents(input_path: Path) -> list[Document]:
     """
-    01_load_pdfplumber.py에서 저장한 parsed_docs.jsonl을
-    LangChain Document 리스트로 다시 불러오기
+    2_load_txt.py가 저장한 parsed_docs.jsonl을 Document 리스트로 복원
     """
     if not input_path.exists():
         raise FileNotFoundError(f"파일을 찾을 수 없습니다: {input_path}")
@@ -33,14 +35,10 @@ def load_parsed_documents(input_path: Path) -> list[Document]:
     with input_path.open("r", encoding="utf-8") as f:
         for line in f:
             row = json.loads(line)
-
-            metadata = dict(row.get("metadata", {}))
-            metadata["parent_doc_id"] = row.get("doc_id")
-
             docs.append(
                 Document(
                     page_content=row["page_content"],
-                    metadata=metadata,
+                    metadata=dict(row.get("metadata", {})),
                 )
             )
 
@@ -48,61 +46,22 @@ def load_parsed_documents(input_path: Path) -> list[Document]:
 
 
 # =========================
-# 3. chunk_id 생성
-# =========================
-
-def make_chunk_id(doc: Document, chunk_index: int) -> str:
-    """
-    같은 문서를 같은 방식으로 청킹하면 같은 id가 나오도록
-    source, page, chunk_index, text 일부를 기반으로 hash 생성
-    """
-    source = doc.metadata.get("source", "unknown")
-    page = doc.metadata.get("page_number", doc.metadata.get("page", "unknown"))
-    text = doc.page_content[:100]
-
-    raw = f"{source}:{page}:{chunk_index}:{text}"
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-
-    return f"chunk-{digest}"
-
-
-# =========================
-# 4. 청킹
+# 3. 청킹
+# -------------------------
+# 문단(빈 줄) → 줄 → 문장 순으로 잘라 문맥이 최대한 안 끊기게 한다.
+# 기술 문헌은 문단 단위 의미가 강해서 "\n\n"을 최우선 separator로 둔다.
 # =========================
 
 def chunk_documents(docs: list[Document]) -> list[Document]:
-    """
-    약관 문서 구조를 고려해 청킹
-
-    chunk_size:
-      - 한 청크의 최대 문자 수
-
-    chunk_overlap:
-      - 청크 사이에 겹쳐서 넣을 문자 수
-      - 검색 시 앞뒤 문맥이 끊기지 않도록 설정
-    """
-
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
+        chunk_size=500,
         chunk_overlap=80,
         add_start_index=True,
         keep_separator=True,
         separators=[
-            "\n제",      # 제1조, 제2조 같은 조항
-            "\n①",
-            "\n②",
-            "\n③",
-            "\n④",
-            "\n⑤",
-            "\n1.",
-            "\n2.",
-            "\n3.",
-            "\n가.",
-            "\n나.",
-            "\n다.",
-            "\n\n",
-            "\n",
-            ". ",
+            "\n\n",   # 문단
+            "\n",     # 줄
+            ". ",     # 문장
             " ",
             "",
         ],
@@ -110,22 +69,29 @@ def chunk_documents(docs: list[Document]) -> list[Document]:
 
     chunks = text_splitter.split_documents(docs)
 
+    # 문서별 청크 순번을 매기기 위한 카운터
+    per_doc_index: dict[str, int] = {}
     cleaned_chunks = []
 
-    for i, chunk in enumerate(chunks):
+    for chunk in chunks:
         text = chunk.page_content.strip()
 
-        if not text:
-            continue
-
-        # 너무 짧은 청크는 제거
+        # 너무 짧은 청크는 버린다
         if len(text) < 20:
             continue
 
-        chunk.metadata["chunk_index"] = len(cleaned_chunks)
-        chunk.metadata["chunk_id"] = make_chunk_id(chunk, len(cleaned_chunks))
-        chunk.metadata["char_count"] = len(text)
+        doc_id = chunk.metadata.get("doc_id", "unknown")
 
+        # 문서 안에서 0,1,2... 로 증가하는 순번
+        idx = per_doc_index.get(doc_id, 0)
+        per_doc_index[doc_id] = idx + 1
+
+        # 사람이 읽기 좋은 chunk_id: "etch_rca_guide#c00"
+        chunk_id = f"{doc_id}#c{idx:02d}"
+
+        chunk.metadata["chunk_id"] = chunk_id
+        chunk.metadata["chunk_index"] = idx
+        chunk.metadata["char_count"] = len(text)
         chunk.page_content = text
 
         cleaned_chunks.append(chunk)
@@ -134,7 +100,7 @@ def chunk_documents(docs: list[Document]) -> list[Document]:
 
 
 # =========================
-# 5. JSONL 저장
+# 4. JSONL 저장
 # =========================
 
 def save_chunks_to_jsonl(chunks: list[Document], output_path: Path) -> None:
@@ -148,17 +114,16 @@ def save_chunks_to_jsonl(chunks: list[Document], output_path: Path) -> None:
                 "page_content": chunk.page_content,
                 "metadata": chunk.metadata,
             }
-
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 # =========================
-# 6. 실행
+# 5. 실행
 # =========================
 
 def main() -> None:
     docs = load_parsed_documents(INPUT_PATH)
-    print("불러온 문서 수:", len(docs))
+    print("불러온 문헌 수:", len(docs))
 
     chunks = chunk_documents(docs)
     print("생성된 청크 수:", len(chunks))
@@ -168,13 +133,11 @@ def main() -> None:
 
     print("\n미리보기")
     print("=" * 80)
-
     for chunk in chunks[:3]:
         print("chunk_id:", chunk.metadata["chunk_id"])
-        print("page:", chunk.metadata.get("page_number", chunk.metadata.get("page")))
-        print("start_index:", chunk.metadata.get("start_index"))
+        print("doc_id:", chunk.metadata.get("doc_id"))
         print("char_count:", chunk.metadata["char_count"])
-        print(chunk.page_content[:500])
+        print(chunk.page_content[:300])
         print("-" * 80)
 
 

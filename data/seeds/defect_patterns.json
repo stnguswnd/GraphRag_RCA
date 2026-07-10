@@ -1,0 +1,29 @@
+{
+  "_comment": "(:DefectPattern) 시드 - 3종 고정 (schema.md). id는 유일 키이며 VLM 출력 클래스와 반드시 동일. 이 목록을 바꾸면 5_build_kg_from_chunks.py의 DefectPatternId Literal도 함께 바꿔야 한다. spatial_keywords/expected_zone/expected_shape는 정합성 체크용이며 '연결(매칭)'에는 사용 금지.",
+  "nodes": [
+    {
+      "id": "Center",
+      "name": "Center",
+      "aliases": ["center defect", "center cluster", "bullseye center", "bulls eye", "wafer center"],
+      "spatial_keywords": ["center", "middle", "core"],
+      "expected_zone": ["center"],
+      "expected_shape": ["blob", "cluster"]
+    },
+    {
+      "id": "Scratch",
+      "name": "Scratch",
+      "aliases": ["scratch defect", "scuff mark", "surface scratch"],
+      "spatial_keywords": ["scratch", "scuff", "surface"],
+      "expected_zone": ["mid"],
+      "expected_shape": ["line", "elongated"]
+    },
+    {
+      "id": "Edge-Ring",
+      "name": "Edge-Ring",
+      "aliases": ["edge ring defect", "edge ring", "peripheral ring", "outer ring", "circular ring", "엣지링"],
+      "spatial_keywords": ["edge", "ring", "peripheral", "omni"],
+      "expected_zone": ["edge"],
+      "expected_shape": ["ring"]
+    }
+  ]
+}

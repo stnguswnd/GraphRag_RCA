@@ -1,9 +1,13 @@
 import os
+import sys
 import json
 from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_neo4j import Neo4jGraph
+
+# Windows 콘솔(cp949)에서 em-dash 등 유니코드 출력 시 크래시 방지
+sys.stdout.reconfigure(encoding="utf-8")
 
 
 # =========================
@@ -15,64 +19,16 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 
 CHUNKS_PATH = BASE_DIR / "outputs" / "chunks.jsonl"
+SEEDS_DIR = BASE_DIR / "data" / "seeds"
 
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")
 
-DOC_ID = "kb_pet_insurance"
-DOC_TITLE = "KB 반려행복펫보험"
 
 # =========================
-# 2. chunks.jsonl 로드
-# =========================
-
-def load_chunks(path: Path) -> list[dict]:
-    """
-    02_split.py에서 저장한 outputs/chunks.jsonl 불러오기
-    """
-
-    if not path.exists():
-        raise FileNotFoundError(f"chunks.jsonl 파일을 찾을 수 없습니다: {path}")
-
-    chunks = []
-
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            row = json.loads(line)
-
-            metadata = row.get("metadata", {})
-
-            page = metadata.get("page")
-            page_number = metadata.get("page_number")
-
-            # page_number가 없으면 page를 기준으로 보정합
-            if page_number is None:
-                if isinstance(page, int):
-                    page_number = page + 1
-                else:
-                    page_number = 0
-
-            chunk = {
-                "chunk_id": row["chunk_id"],
-                "chunk_index": row["chunk_index"],
-                "text": row["page_content"],
-                "source": metadata.get("source"),
-                "page": page,
-                "page_number": page_number,
-                "start_index": metadata.get("start_index"),
-                "char_count": metadata.get("char_count"),
-                "parent_doc_id": metadata.get("parent_doc_id"),
-            }
-
-            chunks.append(chunk)
-
-    return chunks
-
-
-# =========================
-# 3. Neo4j 연결
+# 2. Neo4j 연결
 # =========================
 
 def get_graph() -> Neo4jGraph:
@@ -85,150 +41,205 @@ def get_graph() -> Neo4jGraph:
 
 
 # =========================
-# 4. 제약 조건 생성
+# 3. 제약 조건 생성
+# -------------------------
+# 모든 노드는 라벨별로 UNIQUE한 `id`를 유일 키로 갖는다 (schema.md §Node Types).
+# 시드 앵커 3종 + 문헌에서 뽑는 3종(5번에서 생성) + Document/Chunk.
+# MERGE가 중복 노드를 만들지 않도록 하는 안전장치.
 # =========================
 
 def create_constraints(graph: Neo4jGraph) -> None:
-    """
-    MERGE가 안정적으로 동작하도록 id 유니크 제약조건 생성
-    """
-
-    graph.query("""
-    CREATE CONSTRAINT kb_document_id_unique IF NOT EXISTS
-    FOR (d:KBDocument)
-    REQUIRE d.id IS UNIQUE
-    """)
-
-    graph.query("""
-    CREATE CONSTRAINT page_id_unique IF NOT EXISTS
-    FOR (p:Page)
-    REQUIRE p.id IS UNIQUE
-    """)
-
-    graph.query("""
-    CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS
-    FOR (c:Chunk)
-    REQUIRE c.id IS UNIQUE
-    """)
+    statements = [
+        "CREATE CONSTRAINT defect_pattern_id IF NOT EXISTS FOR (n:DefectPattern) REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT process_step_id   IF NOT EXISTS FOR (n:ProcessStep)   REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT parameter_id      IF NOT EXISTS FOR (n:Parameter)     REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT failure_mode_id   IF NOT EXISTS FOR (n:FailureMode)   REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT cause_id          IF NOT EXISTS FOR (n:Cause)         REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT equipment_id      IF NOT EXISTS FOR (n:Equipment)     REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT chunk_id_unique    IF NOT EXISTS FOR (c:Chunk)    REQUIRE c.id IS UNIQUE",
+        "CREATE CONSTRAINT document_id_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
+    ]
+    for stmt in statements:
+        graph.query(stmt)
 
 
 # =========================
-# 5. Document / Page / Chunk 저장
+# 4. 시드 노드 적재 (앵커)
+# -------------------------
+# DefectPattern / ProcessStep / Parameter 는 문헌에서 뽑는 게 아니라
+# 미리 정해진 고정 목록(enum)이다. data/seeds/*.json 을 읽어 그대로 MERGE 한다.
+# 문헌이 이 id들을 언급하면 새로 만들지 않고 여기 연결한다(= 앵커).
+#
+# ProcessStep.id  ↔ fab의 lot_history.step
+# Parameter.id    ↔ fab의 telemetry.param   (가설 검증 SQL의 join key)
+# =========================
+
+def load_seed(file_name: str) -> list[dict]:
+    path = SEEDS_DIR / file_name
+    if not path.exists():
+        raise FileNotFoundError(f"시드 파일을 찾을 수 없습니다: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data["nodes"]
+
+
+def seed_defect_patterns(graph: Neo4jGraph) -> None:
+    nodes = load_seed("defect_patterns.json")
+    graph.query(
+        """
+        UNWIND $nodes AS n
+        MERGE (p:DefectPattern {id: n.id})
+        SET p.name = n.name,
+            p.aliases = n.aliases,
+            p.spatial_keywords = n.spatial_keywords,
+            p.expected_zone = n.expected_zone,
+            p.expected_shape = n.expected_shape
+        """,
+        params={"nodes": nodes},
+    )
+
+
+def seed_process_steps(graph: Neo4jGraph) -> None:
+    nodes = load_seed("process_steps.json")
+    graph.query(
+        """
+        UNWIND $nodes AS n
+        MERGE (s:ProcessStep {id: n.id})
+        SET s.name = n.name,
+            s.aliases = n.aliases
+        """,
+        params={"nodes": nodes},
+    )
+
+
+def seed_parameters(graph: Neo4jGraph) -> None:
+    nodes = load_seed("parameters.json")
+    graph.query(
+        """
+        UNWIND $nodes AS n
+        MERGE (p:Parameter {id: n.id})
+        SET p.name = n.name,
+            p.steps = n.steps,
+            p.aliases = n.aliases
+        """,
+        params={"nodes": nodes},
+    )
+
+
+def seed_all_anchors(graph: Neo4jGraph) -> None:
+    seed_defect_patterns(graph)
+    seed_process_steps(graph)
+    seed_parameters(graph)
+
+
+# =========================
+# 5. chunks.jsonl 로드
+# =========================
+
+def load_chunks(path: Path) -> list[dict]:
+    if not path.exists():
+        raise FileNotFoundError(f"chunks.jsonl 파일을 찾을 수 없습니다: {path}")
+
+    chunks = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            metadata = row.get("metadata", {})
+            chunks.append({
+                "chunk_id": row["chunk_id"],
+                "chunk_index": row["chunk_index"],
+                "text": row["page_content"],
+                "doc_id": metadata.get("doc_id"),
+                "title": metadata.get("title"),
+                "source": metadata.get("source"),
+                "start_index": metadata.get("start_index"),
+                "char_count": metadata.get("char_count"),
+            })
+    return chunks
+
+
+# =========================
+# 6. Document / Chunk 저장
+# -------------------------
+# (:Document)-[:HAS_CHUNK]->(:Chunk)
 # =========================
 
 def save_chunks(graph: Neo4jGraph, chunks: list[dict]) -> None:
-    """
-    chunks.jsonl의 청크들을 Neo4j에 저장
-
-    생성되는 구조:
-    (:KBDocument)-[:HAS_PAGE]->(:Page)-[:HAS_CHUNK]->(:Chunk)
-    """
-
     graph.query(
         """
-        MERGE (d:KBDocument {id: $doc_id})
-        SET d.title = $doc_title
-
-        WITH d
         UNWIND $chunks AS row
 
-        MERGE (p:Page {id: $doc_id + ":page:" + toString(row.page_number)})
-        SET p.page = row.page,
-            p.page_number = row.page_number,
-            p.source = row.source
+        MERGE (d:Document {id: row.doc_id})
+        SET d.title = row.title,
+            d.source = row.source
 
         MERGE (c:Chunk {id: row.chunk_id})
         SET c.text = row.text,
             c.chunk_index = row.chunk_index,
+            c.doc_id = row.doc_id,
             c.source = row.source,
-            c.page = row.page,
-            c.page_number = row.page_number,
             c.start_index = row.start_index,
-            c.char_count = row.char_count,
-            c.parent_doc_id = row.parent_doc_id
+            c.char_count = row.char_count
 
-        MERGE (d)-[:HAS_PAGE]->(p)
-        MERGE (p)-[:HAS_CHUNK]->(c)
+        MERGE (d)-[:HAS_CHUNK]->(c)
         """,
-        params={
-            "doc_id": DOC_ID,
-            "doc_title": DOC_TITLE,
-            "chunks": chunks,
-        },
+        params={"chunks": chunks},
     )
 
 
 # =========================
-# 6. 청크 순서 관계 생성
+# 7. 청크 순서 관계 (문서별)
+# -------------------------
+# 같은 문서 안에서만 chunk_index 순서대로 NEXT_CHUNK 를 잇는다.
 # =========================
 
 def create_next_chunk_relationships(graph: Neo4jGraph) -> None:
-    """
-    같은 문서 안에서 청크 순서를 보존
-
-    (:Chunk)-[:NEXT_CHUNK]->(:Chunk)
-    """
-
     graph.query(
         """
-        MATCH (c:Chunk)
+        MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)
         WHERE c.chunk_index IS NOT NULL
-        WITH c
+        WITH d, c
         ORDER BY c.chunk_index ASC
-        WITH collect(c) AS chunks
+        WITH d, collect(c) AS chunks
+        WHERE size(chunks) > 1
 
         UNWIND range(0, size(chunks) - 2) AS i
-        WITH chunks[i] AS current_chunk,
-             chunks[i + 1] AS next_chunk
-
-        MERGE (current_chunk)-[:NEXT_CHUNK]->(next_chunk)
+        WITH chunks[i] AS cur, chunks[i + 1] AS nxt
+        MERGE (cur)-[:NEXT_CHUNK]->(nxt)
         """
     )
 
 
 # =========================
-# 7. 확인용 출력
+# 8. 확인용 출력
 # =========================
 
 def print_summary(graph: Neo4jGraph) -> None:
-    doc_count = graph.query("""
-    MATCH (d:KBDocument)
-    RETURN count(d) AS count
-    """)
+    def count(label: str) -> int:
+        return graph.query(f"MATCH (n:{label}) RETURN count(n) AS c")[0]["c"]
 
-    page_count = graph.query("""
-    MATCH (p:Page)
-    RETURN count(p) AS count
-    """)
-
-    chunk_count = graph.query("""
-    MATCH (c:Chunk)
-    RETURN count(c) AS count
-    """)
-
-    rel_count = graph.query("""
-    MATCH ()-[r]->()
-    RETURN count(r) AS count
-    """)
-
-    print("문서 수:", doc_count[0]["count"])
-    print("페이지 수:", page_count[0]["count"])
-    print("청크 수:", chunk_count[0]["count"])
-    print("관계 수:", rel_count[0]["count"])
+    print("DefectPattern:", count("DefectPattern"))
+    print("ProcessStep:", count("ProcessStep"))
+    print("Parameter:", count("Parameter"))
+    print("Document:", count("Document"))
+    print("Chunk:", count("Chunk"))
 
 
 # =========================
-# 8. 실행
+# 9. 실행
 # =========================
 
 def main() -> None:
-    chunks = load_chunks(CHUNKS_PATH)
-
-    print("불러온 청크 수:", len(chunks))
-
     graph = get_graph()
 
+    print("제약조건 생성...")
     create_constraints(graph)
+
+    print("시드 앵커 적재...")
+    seed_all_anchors(graph)
+
+    chunks = load_chunks(CHUNKS_PATH)
+    print("불러온 청크 수:", len(chunks))
+
     save_chunks(graph, chunks)
     create_next_chunk_relationships(graph)
 

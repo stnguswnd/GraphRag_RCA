@@ -1,11 +1,34 @@
+"""
+관측된 불량 패턴 → 근본 원인 가설 3건.
+
+질문이 "{패턴} 결함 패턴이 나타나는 근본 원인은 무엇인가요?" 하나로 고정이므로
+Cypher를 LLM에게 생성시키지 않는다(구 버전은 6_ask_graphrag_backup.py).
+그래프 순회는 결정적으로 하고, LLM은 뽑아온 사실을 가설 문장으로 옮기기만 한다.
+
+가설 1건 = DefectPattern -ARISES_IN-> ProcessStep <-OCCURS_IN- FailureMode
+            -CAUSED_BY-> Cause -INVOLVES_PARAMETER-> Parameter
+
+Parameter까지 이어지지 않는 경로는 가설로 치지 않는다. fab SQL로 검증할 수 없기 때문이다.
+"""
+
 import os
+import sys
+import json
+from pathlib import Path
+
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
+# Windows 콘솔(cp949)에서 em-dash 등 유니코드 출력 시 크래시 방지
+sys.stdout.reconfigure(encoding="utf-8")
 
 from langchain_openai import ChatOpenAI
-from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
-from langchain_core.prompts import PromptTemplate
+from langchain_neo4j import Neo4jGraph
 
 load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
+SEEDS_DIR = BASE_DIR / "data" / "seeds"
 
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
@@ -14,73 +37,148 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
 
-graph = Neo4jGraph(
-    url=NEO4J_URI,
-    username=NEO4J_USERNAME,
-    password=NEO4J_PASSWORD,
-    database=NEO4J_DATABASE,
-)
-graph.refresh_schema()
+TOP_K = 3
 
-llm = ChatOpenAI(
-    model=OPENAI_MODEL,
-    temperature=0,
-)
 
-CYPHER_GENERATION_TEMPLATE = """
-당신은 Neo4j Cypher 전문가입니다.
-사용자의 질문에 답하기 위한 Cypher만 생성하세요.
+# =========================
+# 1. 가설 경로 조회 (결정적 Cypher)
+# =========================
 
-규칙:
-- 읽기 전용 쿼리만 생성하세요. CREATE, MERGE, DELETE, SET, REMOVE 사용 금지.
-- 반환 결과는 최대 10개로 제한하세요.
-- 긴 Chunk.text 전체를 많이 반환하지 마세요.
-- 필요한 경우 evidence, name, type, page_number, chunk_id 정도만 반환하세요.
-- 가변 길이 경로 `*0..3` 같은 넓은 탐색은 가능하면 피하세요.
-- 백틱(`)을 사용하지 마세요.
-- Cypher 코드만 출력하세요. 설명하지 마세요.
-
-스키마:
-{schema}
-
-질문:
-{question}
+HYPOTHESIS_QUERY = """
+MATCH (p:DefectPattern {id: $pattern})-[a:ARISES_IN]->(s:ProcessStep)
+MATCH (fm:FailureMode)-[:OCCURS_IN]->(s)
+MATCH (fm)-[cb:CAUSED_BY]->(c:Cause)
+MATCH (c)-[ip:INVOLVES_PARAMETER]->(param:Parameter)
+RETURN s.id            AS step,
+       fm.id           AS failure_mode,
+       fm.name         AS failure_mode_name,
+       c.id            AS cause,
+       c.name          AS cause_name,
+       c.description   AS cause_description,
+       param.id        AS parameter,
+       ip.direction    AS direction,
+       a.occurrence_prior AS occurrence_prior,
+       (coalesce(a.extraction_confidence, 3)
+        + coalesce(cb.extraction_confidence, 3)
+        + coalesce(ip.extraction_confidence, 3)) / 3.0 AS confidence,
+       cb.quotes       AS quotes,
+       a.chunk_ids     AS pattern_evidence
 """
 
-cypher_prompt = PromptTemplate(
-    input_variables=["schema", "question"],
-    template=CYPHER_GENERATION_TEMPLATE,
-)
+PRIOR_RANK = {"high": 3, "mid": 2, "low": 1}
 
-chain = GraphCypherQAChain.from_llm(
-    llm=llm,
-    graph=graph,
-    cypher_prompt=cypher_prompt,
-    verbose=True,
-    validate_cypher=True,
-    allow_dangerous_requests=True,
-    top_k=5,
-)
 
-questions = [
-    "우리집 댕댕이가 너무 짖어서 윗집에서 피해보상을 하라는데, 가입한 보험으로 처리 될까?",
-    "우리집 강아지 죽으면 위로금은 보상돼?",
-    "보상하지 않는 경우는 뭐야?",
-    "보험금 청구할 때 어떤 서류가 필요해?",
-    "보험금은 언제 지급돼?",
-]
+def fetch_hypotheses(graph: Neo4jGraph, pattern: str) -> list[dict]:
+    rows = graph.query(HYPOTHESIS_QUERY, params={"pattern": pattern})
 
-for question in questions:
-    print("=" * 80)
-    print("질문:", question)
+    # 같은 (원인, 검증변수) 쌍이 여러 공정 경로로 중복될 수 있다. 가장 강한 것만 남긴다.
+    best: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        key = (row["cause"], row["parameter"])
+        prior = PRIOR_RANK.get(row["occurrence_prior"], 1)
+        row["_score"] = (prior, row["confidence"])
+        if key not in best or row["_score"] > best[key]["_score"]:
+            best[key] = row
 
-    try:
-        result = chain.invoke({"query": question})
+    return sorted(best.values(), key=lambda r: r["_score"], reverse=True)[:TOP_K]
 
-        print("\n답변:")
-        print(result["result"])
 
-    except Exception as e:
-        print("\n에러 발생:")
-        print(type(e).__name__)
-        print(e)
+# =========================
+# 2. 가설 문장 생성 (LLM은 여기서만 쓴다)
+# =========================
+
+class Hypotheses(BaseModel):
+    hypotheses: list[str] = Field(
+        description="가설 문장 리스트. 입력으로 준 경로 순서를 그대로 유지한다. 번호는 붙이지 않는다."
+    )
+
+
+SYNTHESIS_PROMPT = """
+반도체 웨이퍼 결함 근본원인 분석(RCA) 결과를 보고합니다.
+
+관측된 불량 패턴: {pattern}
+
+지식그래프에서 아래 {n}개의 인과 경로를 찾았습니다.
+각 경로를 한국어 가설 문장 하나로 옮기세요.
+
+경로:
+{paths}
+
+작성 규칙:
+- 경로 하나당 문장 하나. 입력 순서를 그대로 유지하세요.
+- 주어진 사실만 쓰고 새로운 원인이나 변수를 지어내지 마세요.
+- 각 문장에 공정, 고장 모드, 근본 원인, 검증할 변수를 모두 담으세요.
+- "{pattern} 패턴은 ... 로 보이며, ...를 확인해야 합니다" 같은 가설 어투로 쓰세요.
+- direction이 high면 "값이 높은지", low면 "값이 낮은지"를 확인하라고 쓰세요.
+- 문장 앞에 번호를 붙이지 마세요.
+"""
+
+
+def describe_path(row: dict) -> str:
+    direction = {"high": "높음", "low": "낮음"}.get(row["direction"], "이상 여부")
+    return (
+        f"- 공정: {row['step']}\n"
+        f"  고장 모드: {row['failure_mode_name']} ({row['failure_mode']})\n"
+        f"  근본 원인: {row['cause_name']} ({row['cause']})\n"
+        f"  원인 설명: {row['cause_description']}\n"
+        f"  검증 변수: {row['parameter']} (예상 방향: {direction})\n"
+        f"  패턴→공정 근거 강도: {row['occurrence_prior']}, 평균 추출 신뢰도: {row['confidence']:.1f}"
+    )
+
+
+def synthesize(llm, pattern: str, rows: list[dict]) -> list[str]:
+    paths = "\n".join(describe_path(r) for r in rows)
+    prompt = SYNTHESIS_PROMPT.format(pattern=pattern, n=len(rows), paths=paths)
+    result = llm.with_structured_output(Hypotheses, method="json_schema").invoke(prompt)
+    return result.hypotheses
+
+
+# =========================
+# 3. 실행
+# =========================
+
+def load_pattern_ids() -> list[str]:
+    data = json.loads((SEEDS_DIR / "defect_patterns.json").read_text(encoding="utf-8"))
+    return [n["id"] for n in data["nodes"]]
+
+
+def main() -> None:
+    graph = Neo4jGraph(
+        url=NEO4J_URI,
+        username=NEO4J_USERNAME,
+        password=NEO4J_PASSWORD,
+        database=NEO4J_DATABASE,
+    )
+    llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
+
+    for pattern in load_pattern_ids():
+        print("=" * 80)
+        print(f"질문: {pattern} 결함 패턴이 나타나는 근본 원인은 무엇인가요?")
+        print()
+
+        rows = fetch_hypotheses(graph, pattern)
+
+        if not rows:
+            print("가설 없음. 그래프에 이 패턴의 완전한 경로")
+            print("(DefectPattern→ProcessStep→FailureMode→Cause→Parameter)가 없습니다.")
+            print()
+            continue
+
+        if len(rows) < TOP_K:
+            print(f"(경고: 완전한 경로가 {len(rows)}개뿐이라 가설 {len(rows)}건만 냅니다)")
+            print()
+
+        for i, (sentence, row) in enumerate(zip(synthesize(llm, pattern, rows), rows), start=1):
+            print(f"{i}. {sentence}")
+            print(
+                f"   근거: {pattern} -[ARISES_IN]-> {row['step']}"
+                f" <-[OCCURS_IN]- {row['failure_mode']}"
+                f" -[CAUSED_BY]-> {row['cause']}"
+                f" -[INVOLVES_PARAMETER]-> {row['parameter']}"
+            )
+            print(f"   검증: telemetry.param = '{row['parameter']}' (방향 {row['direction']})")
+            print()
+
+
+if __name__ == "__main__":
+    main()
