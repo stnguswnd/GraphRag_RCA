@@ -57,12 +57,53 @@ DefectPattern ──ARISES_IN──> ProcessStep <──OCCURS_IN── FailureM
 
 ## 준비
 
+### 1. Neo4j 설치 (로컬 DB가 있어야 파이프라인이 돈다)
+
+가장 간단한 건 **Neo4j Desktop** ([다운로드](https://neo4j.com/download/)).
+설치 후 DBMS를 하나 만들고 비밀번호를 정한 뒤 **Start**로 띄운다.
+기본 Bolt 포트는 `7687`, 브라우저 콘솔은 `http://localhost:7474`.
+
+Docker를 쓴다면:
+
+```bash
+docker run -d --name neo4j-rca \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/password \
+  neo4j:5
+```
+
+> APOC·GDS 같은 플러그인은 필요 없다. 순회는 순수 Cypher다.
+> DB 이름은 Community Edition 기준 `neo4j` 하나로 고정된다 (`NEO4J_DATABASE`).
+
+### 2. 파이썬 환경
+
 ```bash
 python -m venv .venv
-.venv/Scripts/activate          # Windows
+.venv/Scripts/activate          # Windows (macOS/Linux: source .venv/bin/activate)
 pip install -r requirements.txt
-cp .env_example .env            # NEO4J_*, OPENAI_API_KEY 채우기
 ```
+
+### 3. 환경변수 (`.env`)
+
+`.env_example`을 복사해 값을 채운다. 코드는 `python-dotenv`로 이 파일을 자동으로 읽는다.
+
+```bash
+cp .env_example .env
+```
+
+| 변수 | 예시 | 설명 |
+|---|---|---|
+| `OPENAI_API_KEY` | `sk-...` | 추출·문장 합성용. langchain이 자동으로 읽는다 |
+| `OPENAI_MODEL` | `gpt-5.4-mini` | 5번(추출)·6번(합성)이 쓰는 모델 |
+| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j Bolt 주소 |
+| `NEO4J_USERNAME` | `neo4j` | 기본 계정명 |
+| `NEO4J_PASSWORD` | `password` | **Neo4j 설치 시 정한 비밀번호로 바꿀 것** |
+| `NEO4J_DATABASE` | `neo4j` | Community Edition은 `neo4j` 고정 |
+
+선택 변수: `TOP_K` — `6_ask_graphrag.py`의 패턴별 가설 출력 상한 (미설정 시 전건 출력).
+
+`.env`는 `.gitignore`에 있다. 커밋하지 말 것.
+설정이 끝나면 `python 1_test_connection.py`로 연결을 먼저 확인한다.
 
 ## 실행
 
