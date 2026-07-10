@@ -1,63 +1,54 @@
-import os
+"""
+5단계 — 통합 지식그래프 추출 (형식 무관 + 원인 표준화 내장).
+
+■ 설계 원칙 (뿌리부터 제대로)
+  - 소스 형식을 가리지 않는다. 로딩(2단계)만 txt/pdf별이고, 여기서부턴 청크는 그냥 텍스트다.
+    troubleshooting 문서든 논문 표든, "향후 어떤 새 형식"이든 같은 추출기가 처리한다.
+  - 한 청크에서 담을 수 있는 RCA 구조를 전부 뽑는다:
+      FailureMode / Cause / Equipment
+      + 관계 ARISES_IN, OCCURS_IN, CAUSED_BY, INVOLVES_PARAMETER, ATTRIBUTED_TO
+    문서가 완전한 인과 사슬을 주면 사슬을, 표가 '패턴→원인'만 주면 그것을 뽑는다.
+  - **원인 표준화(canonicalization)를 적재의 일부로 내장한다.** 표현이 달라도 같은 근본원인이면
+    (예: 'rf_power_drift' ↔ 'irregular_rf_operation') 쓰기 전에 한 노드로 합친다.
+    → txt·pdf가 처음부터 같은 Cause 를 공유한다. 사후 봉합(예전 5b/5c) 없이 그래프가 하나로 연결된다.
+
+■ 3-pass
+  1) 추출    — 관련 청크에서 엔티티/관계를 뽑아 메모리에 모은다.
+  2) 표준화  — 전체 Cause 를 임베딩 후보 + LLM 판정으로 클러스터링해 canonical id 를 부여한다.
+  3) 적재    — canonical id 로 Neo4j MERGE. 각 노드는 여러 소스의 근거(chunk_ids/quotes/aliases)를 누적한다.
+"""
+
 import re
 import sys
 import json
 from pathlib import Path
 from typing import Literal, Optional, get_args
 
-from dotenv import load_dotenv
+import numpy as np
 from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-# Windows 콘솔(cp949)에서 em-dash 등 유니코드 출력 시 크래시 방지
+import kg_common as kg
+
 sys.stdout.reconfigure(encoding="utf-8")
 
-from langchain_openai import ChatOpenAI
-from langchain_neo4j import Neo4jGraph
+OUTPUT_PATH = kg.OUTPUTS_DIR / "extracted_kg.jsonl"
+
+# 원인 표준화 파라미터 (2단계 entity resolution)
+CANON_FLOOR = 0.40   # 임베딩 후보 문턱(재현율). 정밀도는 LLM이 담당.
+CANON_TOPK = 4       # 원인 하나당 검토할 이웃 수
 
 
-# =========================
-# 1. 환경 변수 / 경로 설정
-# =========================
-
-load_dotenv()
-
-BASE_DIR = Path(__file__).resolve().parent
-
-CHUNKS_PATH = BASE_DIR / "outputs" / "chunks.jsonl"
-OUTPUT_PATH = BASE_DIR / "outputs" / "extracted_kg.jsonl"
-SEEDS_DIR = BASE_DIR / "data" / "seeds"
-
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
-
-
-# =========================
-# 2. KG 스키마 정의 (schema.md)
-# -------------------------
-# 문헌에서 자유롭게 만드는 노드는 FailureMode / Cause / Equipment 셋.
-# DefectPattern / ProcessStep / Parameter 는 고정 vocabulary(앵커)이며
-# 4번에서 시드로 미리 적재된다. 여기서는 새로 만들지 않고 연결만 한다.
-#
-#   DefectPattern -[ARISES_IN]->  ProcessStep      (문서 A)
-#   FailureMode   -[OCCURS_IN]->  ProcessStep      (문서 B)
-#   FailureMode   -[CAUSED_BY]->  Cause            (문서 B)
-#   Cause         -[INVOLVES_PARAMETER]-> Parameter (문서 B)
-#   Equipment     -[PART_OF]->    ProcessStep      (규칙, LLM 아님)
-# =========================
+# =========================================================================
+# 1. 고정 vocabulary (앵커)
+# =========================================================================
+# 문헌에서 자유 생성하는 노드는 FailureMode/Cause/Equipment.
+# DefectPattern/ProcessStep/Parameter 는 고정 목록이며 4번에서 시드로 적재된다.
 
 ProcessStepId = Literal["LITHO", "ETCH", "DEPO", "CMP", "CLEAN", "EDS"]
-
-# seeds/defect_patterns.json 과 반드시 동일. id == VLM 출력 클래스 (WM-811K 8종)
 DefectPatternId = Literal[
-    "Center", "Donut", "Edge-Loc", "Edge-Ring",
-    "Loc", "Near-Full", "Random", "Scratch",
+    "Center", "Donut", "Edge-Loc", "Edge-Ring", "Loc", "Near-Full", "Random", "Scratch",
 ]
-
-# seeds/parameters.json 과 반드시 동일. id == fab telemetry.param
 ParameterId = Literal[
     "exposure_dose", "focus_offset", "stage_temp", "alignment_offset",
     "rf_power", "chamber_pressure", "he_flow", "temperature", "etch_rate",
@@ -68,139 +59,119 @@ ParameterId = Literal[
 ]
 
 RelationshipKind = Literal[
-    "ARISES_IN",            # DefectPattern -> ProcessStep
-    "OCCURS_IN",            # FailureMode   -> ProcessStep
-    "CAUSED_BY",            # FailureMode   -> Cause
-    "INVOLVES_PARAMETER",   # Cause         -> Parameter
+    "ARISES_IN",           # DefectPattern -> ProcessStep   (패턴이 어느 공정을 의심케)
+    "OCCURS_IN",           # FailureMode   -> ProcessStep   (고장이 일어나는 공정)
+    "CAUSED_BY",           # FailureMode   -> Cause         (고장의 원인)
+    "INVOLVES_PARAMETER",  # Cause         -> Parameter     (원인이 얽힌 검증변수)
+    "ATTRIBUTED_TO",       # DefectPattern -> Cause         (문헌: 패턴의 원인 직결)
 ]
 
-PROCESS_STEP_IDS: set[str] = set(get_args(ProcessStepId))
 DEFECT_PATTERN_IDS: set[str] = set(get_args(DefectPatternId))
+PROCESS_STEP_IDS: set[str] = set(get_args(ProcessStepId))
 PARAMETER_IDS: set[str] = set(get_args(ParameterId))
+
+DEFECT_PATTERN_INDEX = kg.build_alias_index("defect_patterns.json")
+PROCESS_STEP_INDEX = kg.build_alias_index("process_steps.json")
+PARAMETER_INDEX = kg.build_alias_index("parameters.json")
+
+# 관련성 게이트용 표면형: 패턴 또는 공정을 언급하는 청크만 추출 대상.
+# (파라미터 별칭 'pressure'/'temperature' 등은 너무 흔해 게이트에 넣지 않는다 — 구조 앵커만.)
+ANCHOR_SURFACES = sorted(
+    set(DEFECT_PATTERN_INDEX) | set(PROCESS_STEP_INDEX),
+    key=len, reverse=True,
+)
+
+# 공정 언급 근거 확인용(ARISES_IN 환각 차단)
+STEP_SURFACES: dict[str, list[str]] = {}
+for _surf, _canon in PROCESS_STEP_INDEX.items():
+    STEP_SURFACES.setdefault(_canon, []).append(_surf)
 
 
 def assert_enums_match_seeds() -> None:
-    """
-    위 Literal은 LLM에게 넘길 JSON schema를 정적으로 만들어야 해서 하드코딩돼 있다.
-    시드 파일만 고치고 여기를 안 고치면, 문서의 해당 엔티티가 enum에 없어서
-    validate_kg가 관계를 **조용히 버린다**. 시작하자마자 터뜨린다.
-    """
-    pairs = [
+    """Literal(정적 JSON schema용)과 시드가 어긋나면 즉시 터뜨린다."""
+    for file_name, enum_ids in [
         ("defect_patterns.json", DEFECT_PATTERN_IDS),
         ("process_steps.json", PROCESS_STEP_IDS),
         ("parameters.json", PARAMETER_IDS),
-    ]
-    for file_name, enum_ids in pairs:
-        data = json.loads((SEEDS_DIR / file_name).read_text(encoding="utf-8"))
-        seed_ids = {n["id"] for n in data["nodes"]}
+    ]:
+        seed_ids = {n["id"] for n in kg.load_seed_nodes(file_name)}
         if seed_ids != enum_ids:
             raise ValueError(
-                f"{file_name} 과 이 파일의 Literal이 어긋납니다.\n"
-                f"  시드에만 있음: {sorted(seed_ids - enum_ids)}\n"
-                f"  코드에만 있음: {sorted(enum_ids - seed_ids)}\n"
-                f"둘 중 하나를 고쳐 맞추세요. (프롬프트의 고정 목록도 함께)"
+                f"{file_name} 과 Literal 불일치:\n"
+                f"  시드에만: {sorted(seed_ids - enum_ids)}\n  코드에만: {sorted(enum_ids - seed_ids)}"
             )
 
 
-# =========================
-# 2.1 앵커 표기 정규화 (canonicalization)
-# -------------------------
-# LLM은 프롬프트에 canonical id 목록을 받고도 'edge-ring', 'etch' 처럼 표기를 흔든다.
-# 시드의 aliases를 역인덱스로 만들어, 버리기 전에 한 번 canonical id로 갈아끼운다.
-#
-# aliases만 쓰고 spatial_keywords는 쓰지 않는다.
-# 후자는 여러 패턴에 동시에 걸려(예: 'ring'이 Edge-Ring/Donut 양쪽) 매칭에 못 쓴다.
-# =========================
-
-def _normalize_key(raw: str) -> str:
-    """대소문자·하이픈·밑줄·연속 공백 차이를 흡수한다. 'Edge-Ring' == 'edge_ring' == 'edge ring'"""
-    return re.sub(r"[\s\-_]+", " ", raw.strip().lower())
+def mentions_anchor(text: str) -> bool:
+    hay = kg.normalize_key(text)
+    return any(re.search(rf"\b{re.escape(s)}\b", hay) for s in ANCHOR_SURFACES)
 
 
-def _build_alias_index(file_name: str) -> dict[str, str]:
-    data = json.loads((SEEDS_DIR / file_name).read_text(encoding="utf-8"))
-    index: dict[str, str] = {}
-    for node in data["nodes"]:
-        canonical = node["id"]
-        for surface in [canonical, node.get("name", canonical), *node.get("aliases", [])]:
-            index[_normalize_key(surface)] = canonical
-    return index
+def step_grounded_in(step_id: str, text: str) -> bool:
+    hay = kg.normalize_key(text)
+    return any(re.search(rf"\b{re.escape(s)}\b", hay) for s in STEP_SURFACES.get(step_id, []))
 
 
-DEFECT_PATTERN_INDEX = _build_alias_index("defect_patterns.json")
-PROCESS_STEP_INDEX = _build_alias_index("process_steps.json")
-PARAMETER_INDEX = _build_alias_index("parameters.json")
+# 논문 방법론/분류 잡음(물리적 원인 아님). ATTRIBUTED_TO 원인에 특히 흔하다.
+METHOD_NOISE_KEYWORDS = [
+    "misclassif", "training data", "selecting training", "weighting", "weight scheme",
+    "entropy", "voting", "c mean", "filtering", "classification", "classifier",
+    "classify", "location aspect", "location and size", "locations are not fixed",
+    "combining", "combine", "eye defect", "partial ring", "local zone",
+]
 
 
-def resolve_anchor(raw: str, index: dict[str, str]) -> Optional[str]:
-    """앵커 표기 하나를 canonical id로. 못 붙이면 None(호출부가 사유를 남기고 버린다)."""
-    return index.get(_normalize_key(raw))
+def cause_is_noise(cause_id: str, cause_name: str) -> Optional[str]:
+    if kg.resolve(cause_name, DEFECT_PATTERN_INDEX) or kg.resolve(cause_id, DEFECT_PATTERN_INDEX):
+        return "원인이 불량 패턴 이름(동어반복)"
+    text = kg.normalize_key(f"{cause_id} {cause_name}")
+    for kw in METHOD_NOISE_KEYWORDS:
+        if kw in text:
+            return f"방법론/분류 잡음 '{kw}'"
+    return None
 
 
-# canonical ProcessStep id -> 그 공정을 가리키는 모든 표기 (근거 확인용 역방향 맵)
-STEP_SURFACES: dict[str, list[str]] = {}
-for _surface, _canonical in PROCESS_STEP_INDEX.items():
-    STEP_SURFACES.setdefault(_canonical, []).append(_surface)
-
-
-def step_is_grounded_in(step_id: str, chunk_text: str) -> bool:
-    """
-    이 청크 원문이 해당 공정을 실제로 언급하는가.
-
-    LLM은 공정 이름이 하나도 없는 서론 문단에서도 ARISES_IN을 지어낸다(목록 첫 항목인
-    LITHO를 자리채움으로 고름). 프롬프트로는 안 막혀서 여기서 결정적으로 거른다.
-    """
-    haystack = _normalize_key(chunk_text)
-    return any(
-        re.search(rf"\b{re.escape(surface)}\b", haystack)
-        for surface in STEP_SURFACES.get(step_id, [])
-    )
-
+# =========================================================================
+# 2. 추출 스키마
+# =========================================================================
 
 class FailureModeNode(BaseModel):
-    """공정 내부의 고장 모드. 예: post-etch residue, metal corrosion."""
     id: str = Field(description="유일 키. 소문자 snake_case. 예: post_etch_residue")
-    name: str = Field(description="문헌에 쓰인 그대로의 고장 모드 이름. 예: excessive post-etch residue")
+    name: str = Field(description="문헌 표현 그대로")
     description: str = Field(description="완결된 한국어 한 문장")
-    aliases: list[str] = Field(default_factory=list, description="문헌 속 별칭들")
+    aliases: list[str] = Field(default_factory=list)
 
 
 class CauseNode(BaseModel):
-    """고장 모드의 근본 원인. 예: high etch rate, nonuniform etch process."""
     id: str = Field(description="유일 키. 소문자 snake_case. 예: high_etch_rate")
-    name: str = Field(description="문헌에 쓰인 그대로의 원인 이름. 예: incorrect process parameter (high etch rate)")
-    description: str = Field(description="완결된 한국어 한 문장. 나중에 가설 문장의 부품으로 이어 붙인다.")
-    aliases: list[str] = Field(default_factory=list, description="문헌 속 별칭들")
+    name: str = Field(description="문헌 표현 그대로")
+    description: str = Field(description="완결된 한국어 한 문장")
+    aliases: list[str] = Field(default_factory=list)
 
 
 class EquipmentNode(BaseModel):
-    """장비 인스턴스. 문헌이 구체적 장비를 지목할 때만."""
     id: str = Field(description="장비 식별자. 문헌 표기 그대로. 예: ETCH-03")
-    name: str = Field(description="장비 이름. 보통 id와 같다.")
-    equip_group: ProcessStepId = Field(description="이 장비가 속한 공정군")
+    name: str
+    equip_group: ProcessStepId
 
 
 class Relationship(BaseModel):
     """
-    kind 별 (source, target) 규약:
-      - ARISES_IN          : DefectPattern id  -> ProcessStep id
-      - OCCURS_IN          : FailureMode id    -> ProcessStep id
-      - CAUSED_BY          : FailureMode id    -> Cause id
-      - INVOLVES_PARAMETER : Cause id          -> Parameter id
+    kind 별 (source, target):
+      ARISES_IN          : DefectPattern id -> ProcessStep id
+      OCCURS_IN          : FailureMode id   -> ProcessStep id
+      CAUSED_BY          : FailureMode id   -> Cause id
+      INVOLVES_PARAMETER : Cause id         -> Parameter id
+      ATTRIBUTED_TO      : DefectPattern id -> Cause id
     """
     kind: RelationshipKind
-    source: str = Field(description="출발 노드의 id")
-    target: str = Field(description="도착 노드의 id")
-
-    direction: Optional[Literal["high", "low"]] = Field(
-        default=None, description="INVOLVES_PARAMETER 전용: 변수 이상 방향"
-    )
-    occurrence_prior: Optional[Literal["high", "mid", "low"]] = Field(
-        default=None, description="ARISES_IN 전용: 문헌상 흔한 정도(commonly/rare)"
-    )
-    extraction_confidence: float = Field(description="추출 신뢰도 1~5. 애매하면 낮게.")
-    description: str = Field(description="이 관계를 뒷받침하는 완결된 한 문장")
-    quotes: list[str] = Field(default_factory=list, description="근거 원문 스니펫(짧게)")
+    source: str
+    target: str
+    direction: Optional[Literal["high", "low"]] = Field(default=None, description="INVOLVES_PARAMETER 전용")
+    occurrence_prior: Optional[Literal["high", "mid", "low"]] = Field(default=None, description="ARISES_IN 전용")
+    extraction_confidence: float = Field(description="1~5")
+    description: str = Field(description="근거 한 문장")
+    quotes: list[str] = Field(default_factory=list)
 
 
 class RcaGraph(BaseModel):
@@ -210,432 +181,399 @@ class RcaGraph(BaseModel):
     relationships: list[Relationship]
 
 
-# =========================
-# 3. 프롬프트
-# =========================
+# =========================================================================
+# 3. 프롬프트 (형식 무관 단일)
+# =========================================================================
 
 def build_prompt(chunk: dict) -> str:
     return f"""
-다음은 반도체 웨이퍼 불량 원인분석(RCA) 문헌의 한 조각입니다.
-이 조각에서 고장 모드(FailureMode), 원인(Cause), 장비(Equipment)와 그 관계를 지식그래프로 추출하세요.
+다음은 반도체 웨이퍼 불량 원인분석(RCA) 문헌의 한 조각입니다. (troubleshooting 매뉴얼일 수도, 학술 논문 표일 수도 있음)
+이 조각이 담고 있는 RCA 지식을 **있는 만큼** 지식그래프로 추출하세요. 없는 건 억지로 만들지 마세요.
 
-청크 메타데이터:
-- chunk_id: {chunk['chunk_id']}
-- doc_id: {chunk.get('doc_id')}
+뽑을 것:
+- FailureMode: 공정 내부의 고장 모드 (예: post-etch residue, overlay misregistration)
+- Cause: 그 배후 근본 원인 (예: high etch rate, irregular RF operation)
+- Equipment: 문헌이 'ETCH-03'처럼 구체 장비를 지목할 때만
+- 관계:
+  · ARISES_IN          (DefectPattern -> ProcessStep)  "이 불량 패턴은 이 공정을 의심케 한다"
+  · OCCURS_IN          (FailureMode   -> ProcessStep)  "이 고장은 이 공정에서 일어난다" (고장마다 정확히 1개)
+  · CAUSED_BY          (FailureMode   -> Cause)        "이 고장의 원인은 저것"
+  · INVOLVES_PARAMETER (Cause         -> Parameter)    "이 원인은 이 변수 이상과 얽힘" (direction 채우기)
+  · ATTRIBUTED_TO      (DefectPattern -> Cause)        "논문 표: 이 패턴의 원인은 저것" (공정/고장 없이 원인 직결)
 
-추출 규칙:
-- 원문에 명시된 내용만 추출하고, 추측하지 마세요.
-- 의미 있는 내용이 없으면 모든 리스트를 빈 리스트로 반환하세요.
-- 노드 id는 소문자 snake_case. 예: post_etch_residue, high_etch_rate
-- description은 완결된 한국어 한 문장으로 쓰세요.
-- 공정 변수 자체(rf_power, etch_rate 등)를 Cause로 만들지 마세요.
-  변수는 INVOLVES_PARAMETER의 target으로만 씁니다.
-  "etch rate too high"처럼 이상 방향이 붙은 서술만 Cause입니다.
-- FailureMode(증상/고장 모드)와 Cause(그 배후 원인)를 섞지 마세요.
-  예: "excessive post-etch residue"는 FailureMode, "nonuniform etch process"는 Cause.
+아래 세 목록은 **고정**입니다. 새로 만들지 말고 목록 안에서 정확한 문자열로만 매핑하세요. 없으면 그 관계는 만들지 마세요.
+  ProcessStep: LITHO, ETCH, DEPO, CMP, CLEAN, EDS
+  DefectPattern(WM-811K 8종): Center, Donut, Edge-Loc, Edge-Ring, Loc, Near-Full, Random, Scratch
+  Parameter(20): exposure_dose, focus_offset, stage_temp, alignment_offset, rf_power, chamber_pressure,
+    he_flow, temperature, etch_rate, gas_flow, susceptor_temp, deposition_rate, down_force, slurry_flow,
+    flow_rate, megasonic_power, chemical_temp, rinse_time, chuck_temp, contact_resistance
 
-아래 세 목록은 고정입니다. 새로 만들지 말고 목록 안에서만 고르세요.
-해당하는 항목이 목록에 없으면 그 관계는 추출하지 마세요.
+규칙:
+- 원문에 명시된 것만. 노드 id 는 소문자 snake_case. description 은 완결된 한국어 한 문장.
+- 공정 변수 자체(rf_power 등)를 Cause 로 만들지 마세요. 변수는 INVOLVES_PARAMETER 의 target 으로만.
+  "etch rate too high"처럼 이상 방향이 붙은 서술만 Cause 입니다.
+- 불량 패턴(Center/Scratch/...)은 DefectPattern 이지 FailureMode/Cause 가 아닙니다. ARISES_IN/ATTRIBUTED_TO 의 source 로만 씁니다.
+- ARISES_IN 은 원문에 그 공정 이름이 실제 등장할 때만.
+- ATTRIBUTED_TO 는 논문이 "이 패턴 ← 이런 원인"을 표/문장으로 줄 때. 그 Cause 도 causes 목록에 넣으세요.
+  분류/방법론 용어(misclassification, training data 등)나 패턴 이름 자체를 Cause 로 넣지 마세요.
+- 각 관계에 extraction_confidence(1~5)와 근거 quotes 를 채우세요.
 
-공정 단계(ProcessStep) 6종:
-  LITHO, ETCH, DEPO, CMP, CLEAN, EDS
-
-불량 패턴(DefectPattern) 8종 (WM-811K):
-  Center, Donut, Edge-Loc, Edge-Ring, Loc, Near-Full, Random, Scratch
-  (웨이퍼맵 상의 공간 패턴만 해당. "circular ring"→Edge-Ring, "bulls eye"→Center,
-   "linear defect"/"scuff mark"→Scratch, "ring with a hole"→Donut, "entire wafer"→Near-Full)
-
-공정 변수(Parameter) 20종:
-  exposure_dose, focus_offset, stage_temp, alignment_offset,
-  rf_power, chamber_pressure, he_flow, temperature, etch_rate,
-  gas_flow, susceptor_temp, deposition_rate,
-  down_force, slurry_flow,
-  flow_rate, megasonic_power, chemical_temp, rinse_time,
-  chuck_temp, contact_resistance
-
-관계(kind) 4종:
-- ARISES_IN:          (DefectPattern) -> (ProcessStep)  "이 불량 패턴은 이 공정을 의심케 한다" (occurrence_prior 채우기)
-- OCCURS_IN:          (FailureMode)   -> (ProcessStep)  "이 고장 모드는 이 공정에서 일어난다" (고장 모드마다 정확히 1개)
-- CAUSED_BY:          (FailureMode)   -> (Cause)        "이 고장 모드의 원인은 저것이다"
-- INVOLVES_PARAMETER: (Cause)         -> (Parameter)    "이 원인은 이 변수의 이상과 얽힌다" (direction 채우기)
-
-중요:
-- source/target에는 반드시 노드의 id를 쓰세요.
-  고정 목록의 값은 **위에 적힌 문자열 그대로** 대소문자까지 정확히 옮기세요.
-  예: 'Edge-Ring' (O) / 'edge-ring' (X), 'ETCH' (O) / 'etching' (X)
-- ARISES_IN은 **원문에 공정 이름이 실제로 등장할 때만** 만드세요.
-  공정이 언급되지 않은 서론·요약 문단에서는 ARISES_IN을 추측해 만들지 마세요.
-- 불량 패턴(위 8종)은 DefectPattern이지 FailureMode가 아닙니다.
-  'scratch_pattern' 같은 FailureMode를 만들지 마세요. 패턴은 ARISES_IN의 source로만 씁니다.
-  FailureMode는 공정 내부의 고장(post-etch residue, overlay misregistration 등)입니다.
-- 모든 FailureMode에는 OCCURS_IN 관계가 정확히 하나 있어야 합니다.
-- Equipment는 문헌이 "ETCH-03"처럼 구체적 장비를 지목할 때만 만드세요. PART_OF는 만들지 마세요(규칙으로 자동 생성).
-- 각 관계에 extraction_confidence(1~5)와 근거 quotes를 채우세요.
+청크: chunk_id={chunk['chunk_id']}, doc_id={chunk.get('doc_id')}
 
 원문:
 {chunk['text']}
 """
 
 
-# =========================
-# 4. 추출 + 검증
-# =========================
+# =========================================================================
+# 4. 추출 + 검증(가지치기)
+# =========================================================================
 
-def extract_kg_from_chunk(structured_llm, chunk: dict) -> RcaGraph:
-    return structured_llm.invoke(build_prompt(chunk))
+def validate_kg(kg_obj: RcaGraph, chunk_text: str, dropped: list[str]) -> RcaGraph:
+    for fm in kg_obj.failure_modes:
+        fm.id = kg.normalize_id(fm.id)
+    for c in kg_obj.causes:
+        c.id = kg.normalize_id(c.id)
 
-
-def normalize_id(raw: str) -> str:
-    """LLM이 흘린 표기 흔들림 흡수: 소문자 + 공백/하이픈 → 밑줄."""
-    return re.sub(r"[^a-z0-9_]+", "_", raw.strip().lower()).strip("_")
-
-
-def validate_kg(
-    kg: RcaGraph,
-    dropped: Optional[list[str]] = None,
-    chunk_text: str = "",
-) -> RcaGraph:
-    """
-    [Graph Pruning]
-    - FailureMode/Cause id를 정규화한 뒤 관계의 source/target을 같은 규칙으로 맞춘다.
-    - 앵커(DefectPattern/ProcessStep/Parameter) 표기는 시드 aliases로 canonical id에 갈아끼운다.
-      LLM이 'edge-ring', 'etching' 처럼 흔들어도 살린다. 못 붙이면 사유를 남기고 버린다.
-    - 이번 청크에서 추출되지 않은 FailureMode/Cause를 가리키는 관계는 버린다.
-      (없는 노드를 가리키면 Cypher MATCH가 실패해 조용히 유실되므로 미리 자른다)
-    - extraction_confidence 2 미만은 폐기.
-
-    dropped 리스트를 넘기면 버린 관계의 사유가 쌓인다(조용한 유실 방지).
-    """
-    log = dropped if dropped is not None else []
-
-    for fm in kg.failure_modes:
-        fm.id = normalize_id(fm.id)
-    for c in kg.causes:
-        c.id = normalize_id(c.id)
-
-    fm_ids = {fm.id for fm in kg.failure_modes}
-    cause_ids = {c.id for c in kg.causes}
-
+    fm_ids = {fm.id for fm in kg_obj.failure_modes}
+    cause_ids = {c.id for c in kg_obj.causes}
+    cause_name = {c.id: c.name for c in kg_obj.causes}
     valid: list[Relationship] = []
 
-    for rel in kg.relationships:
-        raw = f"{rel.kind} {rel.source!r} -> {rel.target!r}"
-
+    for rel in kg_obj.relationships:
+        raw = f"{rel.kind} {rel.source!r}->{rel.target!r}"
         if rel.extraction_confidence < 2:
-            log.append(f"{raw}: 신뢰도 {rel.extraction_confidence} < 2")
+            dropped.append(f"{raw}: 신뢰도<2")
             continue
-
         src, tgt = rel.source.strip(), rel.target.strip()
 
         if rel.kind == "ARISES_IN":
-            src = resolve_anchor(src, DEFECT_PATTERN_INDEX)
-            tgt = resolve_anchor(tgt, PROCESS_STEP_INDEX)
-            if src is None or tgt is None:
-                log.append(f"{raw}: 앵커 매핑 실패 (DefectPattern/ProcessStep)")
-                continue
-            if chunk_text and not step_is_grounded_in(tgt, chunk_text):
-                log.append(f"{raw}: 청크 원문에 공정 '{tgt}' 언급 없음 (환각)")
-                continue
+            src = kg.resolve(src, DEFECT_PATTERN_INDEX)
+            tgt = kg.resolve(tgt, PROCESS_STEP_INDEX)
+            if not src or not tgt:
+                dropped.append(f"{raw}: 앵커 매핑 실패"); continue
+            if not step_grounded_in(tgt, chunk_text):
+                dropped.append(f"{raw}: 공정 '{tgt}' 원문 언급 없음(환각)"); continue
         elif rel.kind == "OCCURS_IN":
-            src = normalize_id(src)
-            tgt = resolve_anchor(tgt, PROCESS_STEP_INDEX)
-            if src not in fm_ids or tgt is None:
-                log.append(f"{raw}: FailureMode 미추출 또는 ProcessStep 매핑 실패")
-                continue
+            src = kg.normalize_id(src); tgt = kg.resolve(tgt, PROCESS_STEP_INDEX)
+            if src not in fm_ids or not tgt:
+                dropped.append(f"{raw}: FM 미추출/공정 매핑 실패"); continue
         elif rel.kind == "CAUSED_BY":
-            src, tgt = normalize_id(src), normalize_id(tgt)
+            src, tgt = kg.normalize_id(src), kg.normalize_id(tgt)
             if src not in fm_ids or tgt not in cause_ids:
-                log.append(f"{raw}: FailureMode/Cause가 이 청크에서 추출되지 않음")
-                continue
+                dropped.append(f"{raw}: FM/Cause 미추출"); continue
+            noise = cause_is_noise(tgt, cause_name.get(tgt, ""))
+            if noise:
+                dropped.append(f"{raw}: {noise}"); continue
         elif rel.kind == "INVOLVES_PARAMETER":
-            src = normalize_id(src)
-            tgt = resolve_anchor(tgt, PARAMETER_INDEX)
-            if src not in cause_ids or tgt is None:
-                log.append(f"{raw}: Cause 미추출 또는 Parameter 매핑 실패")
-                continue
+            src = kg.normalize_id(src); tgt = kg.resolve(tgt, PARAMETER_INDEX)
+            if src not in cause_ids or not tgt:
+                dropped.append(f"{raw}: Cause 미추출/변수 매핑 실패"); continue
+        elif rel.kind == "ATTRIBUTED_TO":
+            src = kg.resolve(src, DEFECT_PATTERN_INDEX); tgt = kg.normalize_id(tgt)
+            if not src or tgt not in cause_ids:
+                dropped.append(f"{raw}: 패턴 매핑 실패/Cause 미추출"); continue
+            noise = cause_is_noise(tgt, cause_name.get(tgt, ""))
+            if noise:
+                dropped.append(f"{raw}: {noise}"); continue
         else:
-            log.append(f"{raw}: 알 수 없는 kind")
-            continue
+            dropped.append(f"{raw}: 알 수 없는 kind"); continue
 
         rel.source, rel.target = src, tgt
         valid.append(rel)
 
-    # 어떤 FailureMode도 가리키지 않는 Cause는 그래프에서 도달할 수 없다(고아).
-    # 그 Cause를 버리면 거기서 출발하던 INVOLVES_PARAMETER도 같이 버려야 한다.
-    linked_causes = {r.target for r in valid if r.kind == "CAUSED_BY"}
-    for c in kg.causes:
+    # 어떤 FailureMode(CAUSED_BY)도, 어떤 패턴(ATTRIBUTED_TO)도 가리키지 않는 Cause 는 고아 → 버린다.
+    linked_causes = {r.target for r in valid if r.kind in ("CAUSED_BY", "ATTRIBUTED_TO")}
+    for c in kg_obj.causes:
         if c.id not in linked_causes:
-            log.append(f"Cause {c.id!r}: 어떤 FailureMode도 가리키지 않는 고아")
-    causes = [c for c in kg.causes if c.id in linked_causes]
-    valid = [
-        r for r in valid
-        if r.kind != "INVOLVES_PARAMETER" or r.source in linked_causes
-    ]
+            dropped.append(f"Cause {c.id!r}: 고아(연결된 상위 없음)")
+    causes = [c for c in kg_obj.causes if c.id in linked_causes]
+    valid = [r for r in valid if r.kind != "INVOLVES_PARAMETER" or r.source in linked_causes]
 
-    return RcaGraph(
-        failure_modes=kg.failure_modes,
-        causes=causes,
-        equipment=kg.equipment,
-        relationships=valid,
-    )
+    return RcaGraph(failure_modes=kg_obj.failure_modes, causes=causes,
+                    equipment=kg_obj.equipment, relationships=valid)
 
 
-# =========================
-# 5. Neo4j 저장
-# =========================
+# =========================================================================
+# 5. 원인 표준화 (canonicalization) — 적재의 일부
+# =========================================================================
+# 전체 추출에서 나온 Cause 들을 임베딩 후보 + LLM 판정으로 클러스터링해,
+# 같은 근본원인은 하나의 canonical id 로 합친다. txt/pdf 가릴 것 없이 여기서 통합된다.
 
-def get_graph() -> Neo4jGraph:
-    return Neo4jGraph(
-        url=NEO4J_URI,
-        username=NEO4J_USERNAME,
-        password=NEO4J_PASSWORD,
-        database=NEO4J_DATABASE,
-    )
+class SameCauseDecision(BaseModel):
+    same_ids: list[str] = Field(default_factory=list,
+                                description="주어진 원인과 '같은 물리적 근본원인'인 후보 id 들. 없으면 빈 리스트.")
 
 
-# 관계 속성에 이 청크를 근거로 덧붙이는 조각 (중복 없이 append)
-_CHUNK_IDS_SET = """
-            rel.chunk_ids = CASE
-                WHEN rel.chunk_ids IS NULL THEN [$chunk_id]
-                WHEN NOT $chunk_id IN rel.chunk_ids THEN rel.chunk_ids + [$chunk_id]
-                ELSE rel.chunk_ids END
+def _embed(texts: list[str]) -> np.ndarray:
+    vecs = np.array(OpenAIEmbeddings(model=kg.OPENAI_EMBED_MODEL).embed_documents(texts), dtype=np.float32)
+    return vecs / np.clip(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-9, None)
+
+
+class _UF:
+    """
+    검증변수 제약을 클러스터 단위로 강제하는 union-find.
+    각 클러스터는 서로 다른 Parameter 를 최대 1개만 가질 수 있다. 병합 결과 2개 이상이 되면 거부한다.
+    (파라미터 없는 논문 원인을 징검다리로 gas_flow↔chamber_pressure 가 이어지는 전이 누수를 차단.)
+    """
+    def __init__(self, ids, params: dict):
+        self.p = {i: i for i in ids}
+        self.cp = {i: set(params.get(i, set())) for i in ids}   # root -> param 집합
+
+    def find(self, x):
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]; x = self.p[x]
+        return x
+
+    def union(self, a, b) -> bool:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return True
+        combined = self.cp[ra] | self.cp[rb]
+        if len(combined) > 1:        # 서로 다른 검증변수 → 병합 금지
+            return False
+        self.p[ra] = rb
+        self.cp[rb] = combined
+        return True
+
+
+def _param_str(params: set) -> str:
+    return f"[검증변수 {sorted(params)}]" if params else "[검증변수 미상]"
+
+
+def canonicalize_causes(all_causes: dict[str, dict], cause_params: dict[str, set], llm) -> dict[str, str]:
+    """
+    all_causes  : cause_id -> {name, description, count}
+    cause_params: cause_id -> {INVOLVES_PARAMETER 로 걸린 변수 id 집합}
+    반환: cause_id -> canonical_id 매핑.
+
+    병합 규칙: LLM이 '같은 근본원인'이라 판정 + **검증변수가 충돌하지 않을 때만** 합친다.
+    두 원인이 서로 다른 fab 변수(gas_flow vs chamber_pressure 등)에 걸리면, 범주가 같아도
+    다른 원인이다(검증 대상이 다르므로). 이 구조적 제약이 과병합을 막는다.
+    """
+    ids = list(all_causes)
+    if len(ids) < 2:
+        return {i: i for i in ids}
+
+    texts = [f"{all_causes[i]['name']}. {all_causes[i]['description']}" for i in ids]
+    vecs = _embed(texts)
+    sim = vecs @ vecs.T
+    uf = _UF(ids, cause_params)
+
+    print(f"[표준화] 원인 {len(ids)}개 클러스터링 (floor={CANON_FLOOR})")
+    for i, cid in enumerate(ids):
+        order = sorted(range(len(ids)), key=lambda j: sim[i][j], reverse=True)
+        cands = [ids[j] for j in order if j != i and sim[i][j] >= CANON_FLOOR][:CANON_TOPK]
+        if not cands:
+            continue
+        lines = "\n".join(
+            f"  - id={c} | {all_causes[c]['name']}: {all_causes[c]['description']} {_param_str(cause_params.get(c, set()))}"
+            for c in cands
+        )
+        prompt = f"""반도체 RCA에서 아래 '기준 원인'과 **같은 물리적 근본원인**을 뜻하는 후보만 고르세요.
+
+[기준 원인] id={cid} | {all_causes[cid]['name']}: {all_causes[cid]['description']} {_param_str(cause_params.get(cid, set()))}
+
+[후보]
+{lines}
+
+엄격 규칙:
+- 표현만 다르고 **정확히 같은 메커니즘**이면 매칭. (예: 'irregular RF operation' = 'RF power drift')
+- **서로 다른 공정 변수에 얽힌 원인은 다른 원인입니다.** 범주가 비슷해도(둘 다 '유량'/'압력'/'온도')
+  검증변수가 다르면(gas_flow vs chamber_pressure vs slurry_flow; 또는 stage_temp vs susceptor_temp vs chuck_temp)
+  고르지 마세요.
+- 애매하면 고르지 마세요(과병합보다 미병합이 낫다)."""
+        try:
+            dec = llm.with_structured_output(SameCauseDecision, method="json_schema").invoke(prompt)
+        except Exception as e:
+            print("  (판정 실패, 건너뜀)", e); continue
+        for sid in dec.same_ids:
+            if sid in all_causes and sid != cid:
+                uf.union(cid, sid)   # 검증변수 충돌 시 내부에서 거부됨(클러스터 제약)
+
+    # 클러스터별 대표(canonical) 선정: 가장 많이 등장(count) → 이름 짧은 순.
+    clusters: dict[str, list[str]] = {}
+    for i in ids:
+        clusters.setdefault(uf.find(i), []).append(i)
+    mapping: dict[str, str] = {}
+    merged = 0
+    for members in clusters.values():
+        rep = sorted(members, key=lambda i: (-all_causes[i]["count"], len(i)))[0]
+        for m in members:
+            mapping[m] = rep
+        if len(members) > 1:
+            merged += len(members) - 1
+            names = ", ".join(all_causes[m]["name"][:22] for m in members)
+            print(f"  ▶ {rep}  ⇐  {names}")
+    print(f"[표준화] {len(ids)}개 → {len(clusters)}개 (원인 {merged}개 병합)")
+    return mapping
+
+
+# =========================================================================
+# 6. Neo4j 적재 (canonical id 로)
+# =========================================================================
+
+_CHUNK_IDS = """
+    rel.chunk_ids = CASE
+        WHEN rel.chunk_ids IS NULL THEN [$chunk_id]
+        WHEN NOT $chunk_id IN rel.chunk_ids THEN rel.chunk_ids + [$chunk_id]
+        ELSE rel.chunk_ids END
 """
 
 
-def save_kg_to_neo4j(graph: Neo4jGraph, kg: RcaGraph, chunk: dict) -> None:
-    failure_modes = [n.model_dump() for n in kg.failure_modes]
-    causes = [n.model_dump() for n in kg.causes]
-    equipment = [n.model_dump() for n in kg.equipment]
-    rels = [r.model_dump() for r in kg.relationships]
+def write_chunk(graph, kg_obj: RcaGraph, chunk: dict, canon: dict[str, str], canon_meta: dict[str, dict]) -> None:
+    cid = chunk["chunk_id"]
 
-    chunk_id = chunk["chunk_id"]
+    def cmap(x): return canon.get(x, x)
 
-    # (1) FailureMode 노드 + 이 청크가 언급했음을 기록
-    if failure_modes:
-        graph.query(
-            """
-            MATCH (c:Chunk {id: $chunk_id})
-            UNWIND $nodes AS n
-            MERGE (fm:FailureMode {id: n.id})
-            SET fm.name = n.name,
-                fm.description = n.description,
-                fm.aliases = n.aliases
-            MERGE (c)-[:MENTIONS]->(fm)
-            """,
-            params={"chunk_id": chunk_id, "nodes": failure_modes},
-        )
+    if kg_obj.failure_modes:
+        graph.query("""
+            MATCH (ch:Chunk {id:$cid}) UNWIND $ns AS n
+            MERGE (fm:FailureMode {id:n.id})
+            SET fm.name=n.name, fm.description=n.description, fm.aliases=n.aliases
+            MERGE (ch)-[:MENTIONS]->(fm)
+        """, params={"cid": cid, "ns": [n.model_dump() for n in kg_obj.failure_modes]})
 
-    # (2) Cause 노드
-    if causes:
-        graph.query(
-            """
-            MATCH (c:Chunk {id: $chunk_id})
-            UNWIND $nodes AS n
-            MERGE (cause:Cause {id: n.id})
-            SET cause.name = n.name,
-                cause.description = n.description,
-                cause.aliases = n.aliases
-            MERGE (c)-[:MENTIONS]->(cause)
-            """,
-            params={"chunk_id": chunk_id, "nodes": causes},
-        )
+    # Cause 는 canonical id 로. 대표 노드에 이름/설명/별칭(합쳐진 표면형들)을 싣는다.
+    canon_causes = {}
+    for c in kg_obj.causes:
+        rep = cmap(c.id)
+        meta = canon_meta.get(rep, {"name": c.name, "description": c.description})
+        canon_causes[rep] = {"id": rep, "name": meta["name"], "description": meta["description"],
+                             "aliases": meta.get("aliases", [])}
+    if canon_causes:
+        graph.query("""
+            MATCH (ch:Chunk {id:$cid}) UNWIND $ns AS n
+            MERGE (c:Cause {id:n.id})
+            SET c.name=n.name, c.description=n.description, c.aliases=n.aliases
+            MERGE (ch)-[:MENTIONS]->(c)
+        """, params={"cid": cid, "ns": list(canon_causes.values())})
 
-    # (3) Equipment 노드 + PART_OF (equip_group에서 규칙으로 파생)
-    if equipment:
-        graph.query(
-            """
-            MATCH (c:Chunk {id: $chunk_id})
-            UNWIND $nodes AS n
-            MERGE (e:Equipment {id: n.id})
-            SET e.name = n.name,
-                e.equip_group = n.equip_group
-            MERGE (c)-[:MENTIONS]->(e)
-            WITH e, n
-            MATCH (s:ProcessStep {id: n.equip_group})
-            MERGE (e)-[:PART_OF]->(s)
-            """,
-            params={"chunk_id": chunk_id, "nodes": equipment},
-        )
+    if kg_obj.equipment:
+        graph.query("""
+            MATCH (ch:Chunk {id:$cid}) UNWIND $ns AS n
+            MERGE (e:Equipment {id:n.id}) SET e.name=n.name, e.equip_group=n.equip_group
+            MERGE (ch)-[:MENTIONS]->(e)
+            WITH e,n MATCH (s:ProcessStep {id:n.equip_group}) MERGE (e)-[:PART_OF]->(s)
+        """, params={"cid": cid, "ns": [n.model_dump() for n in kg_obj.equipment]})
 
-    if not rels:
-        return
+    rels = []
+    for r in kg_obj.relationships:
+        d = r.model_dump()
+        # Cause 를 참조하는 필드를 canonical id 로 치환한다.
+        if r.kind == "CAUSED_BY":             # target = Cause
+            d["target"] = cmap(r.target)
+        elif r.kind == "INVOLVES_PARAMETER":  # source = Cause
+            d["source"] = cmap(r.source)
+        elif r.kind == "ATTRIBUTED_TO":       # target = Cause
+            d["target"] = cmap(r.target)
+        rels.append(d)
 
-    # (4) ARISES_IN : DefectPattern -> ProcessStep  (문서 A)
-    graph.query(
-        f"""
-        UNWIND $rels AS r
-        WITH r WHERE r.kind = 'ARISES_IN'
-        MATCH (p:DefectPattern {{id: r.source}})
-        MATCH (s:ProcessStep {{id: r.target}})
+    def run(kind, cypher):
+        graph.query(cypher, params={"rels": rels, "chunk_id": cid})
+
+    run("ARISES_IN", f"""UNWIND $rels AS r WITH r WHERE r.kind='ARISES_IN'
+        MATCH (p:DefectPattern {{id:r.source}}),(s:ProcessStep {{id:r.target}})
         MERGE (p)-[rel:ARISES_IN]->(s)
-        SET rel.occurrence_prior = r.occurrence_prior,
-            rel.extraction_confidence = r.extraction_confidence,
-            rel.description = r.description,
-            rel.quotes = r.quotes,
-        {_CHUNK_IDS_SET}
-        """,
-        params={"rels": rels, "chunk_id": chunk_id},
-    )
-
-    # (5) OCCURS_IN : FailureMode -> ProcessStep  (앵커)
-    graph.query(
-        f"""
-        UNWIND $rels AS r
-        WITH r WHERE r.kind = 'OCCURS_IN'
-        MATCH (fm:FailureMode {{id: r.source}})
-        MATCH (s:ProcessStep {{id: r.target}})
+        SET rel.occurrence_prior=r.occurrence_prior, rel.extraction_confidence=r.extraction_confidence,
+            rel.description=r.description, rel.quotes=r.quotes, {_CHUNK_IDS}""")
+    run("OCCURS_IN", f"""UNWIND $rels AS r WITH r WHERE r.kind='OCCURS_IN'
+        MATCH (fm:FailureMode {{id:r.source}}),(s:ProcessStep {{id:r.target}})
         MERGE (fm)-[rel:OCCURS_IN]->(s)
-        SET rel.extraction_confidence = r.extraction_confidence,
-            rel.description = r.description,
-            rel.quotes = r.quotes,
-        {_CHUNK_IDS_SET}
-        """,
-        params={"rels": rels, "chunk_id": chunk_id},
-    )
-
-    # (6) CAUSED_BY : FailureMode -> Cause
-    graph.query(
-        f"""
-        UNWIND $rels AS r
-        WITH r WHERE r.kind = 'CAUSED_BY'
-        MATCH (fm:FailureMode {{id: r.source}})
-        MATCH (c:Cause {{id: r.target}})
+        SET rel.extraction_confidence=r.extraction_confidence, rel.description=r.description,
+            rel.quotes=r.quotes, {_CHUNK_IDS}""")
+    run("CAUSED_BY", f"""UNWIND $rels AS r WITH r WHERE r.kind='CAUSED_BY'
+        MATCH (fm:FailureMode {{id:r.source}}),(c:Cause {{id:r.target}})
         MERGE (fm)-[rel:CAUSED_BY]->(c)
-        SET rel.extraction_confidence = r.extraction_confidence,
-            rel.description = r.description,
-            rel.quotes = r.quotes,
-        {_CHUNK_IDS_SET}
-        """,
-        params={"rels": rels, "chunk_id": chunk_id},
-    )
-
-    # (7) INVOLVES_PARAMETER : Cause -> Parameter  (검증 종착점, direction)
-    graph.query(
-        f"""
-        UNWIND $rels AS r
-        WITH r WHERE r.kind = 'INVOLVES_PARAMETER'
-        MATCH (c:Cause {{id: r.source}})
-        MATCH (p:Parameter {{id: r.target}})
+        SET rel.extraction_confidence=r.extraction_confidence, rel.description=r.description,
+            rel.quotes=r.quotes, {_CHUNK_IDS}""")
+    run("INVOLVES_PARAMETER", f"""UNWIND $rels AS r WITH r WHERE r.kind='INVOLVES_PARAMETER'
+        MATCH (c:Cause {{id:r.source}}),(p:Parameter {{id:r.target}})
         MERGE (c)-[rel:INVOLVES_PARAMETER]->(p)
-        SET rel.direction = r.direction,
-            rel.extraction_confidence = r.extraction_confidence,
-            rel.description = r.description,
-            rel.quotes = r.quotes,
-        {_CHUNK_IDS_SET}
-        """,
-        params={"rels": rels, "chunk_id": chunk_id},
-    )
+        SET rel.direction=r.direction, rel.extraction_confidence=r.extraction_confidence,
+            rel.description=r.description, rel.quotes=r.quotes, {_CHUNK_IDS}""")
+    run("ATTRIBUTED_TO", f"""UNWIND $rels AS r WITH r WHERE r.kind='ATTRIBUTED_TO'
+        MATCH (p:DefectPattern {{id:r.source}}),(c:Cause {{id:r.target}})
+        MERGE (p)-[rel:ATTRIBUTED_TO]->(c)
+        SET rel.source='literature', rel.extraction_confidence=r.extraction_confidence,
+            rel.description=r.description, rel.quotes=r.quotes, {_CHUNK_IDS}""")
 
 
-# =========================
-# 6. 추출 결과 JSONL 저장
-# =========================
+# =========================================================================
+# 7. 실행
+# =========================================================================
 
-def append_result_to_jsonl(output_path: Path, chunk: dict, kg: RcaGraph) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    row = {
-        "chunk_id": chunk["chunk_id"],
-        "doc_id": chunk.get("doc_id"),
-        "kg": kg.model_dump(),
-    }
-    with output_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+def _tally(kg_obj: RcaGraph, all_causes: dict, cause_params: dict) -> None:
+    for c in kg_obj.causes:
+        slot = all_causes.setdefault(c.id, {"name": c.name, "description": c.description, "count": 0})
+        slot["count"] += 1
+    for r in kg_obj.relationships:
+        if r.kind == "INVOLVES_PARAMETER":
+            cause_params.setdefault(r.source, set()).add(r.target)
 
 
-# =========================
-# 7. chunks.jsonl 로드
-# =========================
-
-def load_chunks(path: Path) -> list[dict]:
-    if not path.exists():
-        raise FileNotFoundError(f"chunks.jsonl 파일을 찾을 수 없습니다: {path}")
-    chunks = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            row = json.loads(line)
-            metadata = row.get("metadata", {})
-            chunks.append({
-                "chunk_id": row["chunk_id"],
-                "chunk_index": row["chunk_index"],
-                "text": row["page_content"],
-                "doc_id": metadata.get("doc_id"),
-                "file_type": metadata.get("file_type"),
-            })
-    return chunks
+def collect_from_extraction(targets, structured) -> tuple[list, dict, dict]:
+    """pass 1: 청크마다 LLM 추출 + 검증. 결과를 캐시(jsonl)에도 남긴다."""
+    if OUTPUT_PATH.exists():
+        OUTPUT_PATH.unlink()
+    extracted, all_causes, cause_params = [], {}, {}
+    for i, chunk in enumerate(targets, 1):
+        print(f"[추출 {i}/{len(targets)}] {chunk['chunk_id']}", flush=True)
+        kg_obj = validate_kg(structured.invoke(build_prompt(chunk)), chunk["text"], [])
+        extracted.append(({"chunk_id": chunk["chunk_id"]}, kg_obj))
+        _tally(kg_obj, all_causes, cause_params)
+        with OUTPUT_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"chunk_id": chunk["chunk_id"], "kg": kg_obj.model_dump()}, ensure_ascii=False) + "\n")
+    return extracted, all_causes, cause_params
 
 
-# =========================
-# 8. 실행
-# =========================
+def collect_from_cache() -> tuple[list, dict, dict]:
+    """추출을 건너뛰고 캐시(jsonl)에서 복원한다. (표준화/적재만 다시 돌릴 때)"""
+    extracted, all_causes, cause_params = [], {}, {}
+    for line in OUTPUT_PATH.open(encoding="utf-8"):
+        row = json.loads(line)
+        kg_obj = RcaGraph(**row["kg"])
+        extracted.append(({"chunk_id": row["chunk_id"]}, kg_obj))
+        _tally(kg_obj, all_causes, cause_params)
+    return extracted, all_causes, cause_params
+
 
 def main() -> None:
     assert_enums_match_seeds()
+    resume = "resume" in sys.argv[1:]
+    graph = kg.get_graph()
 
-    chunks = load_chunks(CHUNKS_PATH)
-
-    # 백본(FailureMode/Cause/공정 관계)은 통제된 troubleshooting 문서(txt)에서만 뽑는다.
-    # 논문(pdf)은 노이즈가 커서 여기 넣지 않고, 패턴->원인만 5b_extract_pattern_causes.py가
-    # 타깃 추출한다. 굳이 pdf도 백본에 넣으려면 인자로 doc_id를 넘긴다.
-    only_docs = set(sys.argv[1:])
-    if only_docs:
-        chunks = [c for c in chunks if c["doc_id"] in only_docs]
-        print("대상 doc_id 필터:", only_docs)
+    # ---- pass 1: 추출 (또는 캐시 복원) ----
+    if resume and OUTPUT_PATH.exists():
+        print(f"[resume] 추출 캐시 재사용: {OUTPUT_PATH} (재추출 생략)")
+        extracted, all_causes, cause_params = collect_from_cache()
     else:
-        chunks = [c for c in chunks if c.get("file_type") != "pdf"]
-        print("대상: txt 문서만 (pdf 논문은 5b가 담당)")
+        chunks = kg.load_chunks()
+        targets = [c for c in chunks if mentions_anchor(c["text"])]
+        print(f"전체 {len(chunks)}청크 중 앵커 언급 {len(targets)}청크가 추출 대상 (형식 무관 게이트)")
+        structured = ChatOpenAI(model=kg.OPENAI_MODEL, temperature=0).with_structured_output(
+            RcaGraph, method="json_schema")
+        extracted, all_causes, cause_params = collect_from_extraction(targets, structured)
+    print(f"추출된 고유 원인 {len(all_causes)}개")
 
-    print("처리할 청크 수:", len(chunks))
+    # ---- pass 2: 원인 표준화 ----
+    llm = ChatOpenAI(model=kg.OPENAI_MODEL, temperature=0)
+    canon = canonicalize_causes(all_causes, cause_params, llm)
+    canon_meta: dict[str, dict] = {}   # canonical_id -> {name, description, aliases}
+    for cid, rep in canon.items():
+        m = canon_meta.setdefault(rep, {"name": all_causes[rep]["name"],
+                                        "description": all_causes[rep]["description"], "aliases": []})
+        if cid != rep:
+            m["aliases"].append(all_causes[cid]["name"])
 
-    graph = get_graph()
-
-    llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
-    structured_llm = llm.with_structured_output(RcaGraph, method="json_schema")
-
-    # 재실행 시 결과 파일 초기화
-    if OUTPUT_PATH.exists():
-        OUTPUT_PATH.unlink()
-
-    totals = {"failure_modes": 0, "causes": 0, "equipment": 0, "relationships": 0}
-    total_dropped = 0
-
-    for i, chunk in enumerate(chunks, start=1):
-        print("=" * 80)
-        print(f"[{i}/{len(chunks)}] {chunk['chunk_id']}")
-        print(chunk["text"][:160].replace("\n", " "))
-
-        kg = extract_kg_from_chunk(structured_llm, chunk)
-
-        dropped: list[str] = []
-        kg = validate_kg(kg, dropped, chunk_text=chunk["text"])
-
-        print(
-            "FailureMode:", len(kg.failure_modes),
-            "| Cause:", len(kg.causes),
-            "| Equipment:", len(kg.equipment),
-            "| 관계:", len(kg.relationships),
-        )
-        for reason in dropped:
-            print("  버림:", reason)
-        total_dropped += len(dropped)
-
-        save_kg_to_neo4j(graph, kg, chunk)
-        append_result_to_jsonl(OUTPUT_PATH, chunk, kg)
-
-        totals["failure_modes"] += len(kg.failure_modes)
-        totals["causes"] += len(kg.causes)
-        totals["equipment"] += len(kg.equipment)
-        totals["relationships"] += len(kg.relationships)
+    # ---- pass 3: 적재 ----
+    print("\n[적재] canonical id 로 Neo4j 기록")
+    for chunk, kg_obj in extracted:
+        write_chunk(graph, kg_obj, chunk, canon, canon_meta)
 
     graph.refresh_schema()
-
-    print("\n완료")
-    for key, value in totals.items():
-        print(f"총 추출 {key}: {value}")
-    print("총 버린 관계/노드:", total_dropped)
-    print("결과 저장:", OUTPUT_PATH)
-
-    print("\nGraph schema:")
-    print(graph.schema)
+    n_cause = graph.query("MATCH (c:Cause) RETURN count(c) AS n")[0]["n"]
+    print(f"\n완료. Cause 노드 {n_cause}개 (표준화 후). 결과: {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":

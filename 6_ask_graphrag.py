@@ -11,32 +11,18 @@ Cypher를 LLM에게 생성시키지 않는다(구 버전은 6_ask_graphrag_backu
 Parameter까지 이어지지 않는 경로는 가설로 치지 않는다. fab SQL로 검증할 수 없기 때문이다.
 """
 
-import os
 import sys
-import json
-from pathlib import Path
 
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain_neo4j import Neo4jGraph   # 타입 힌트용
+
+import kg_common as kg
 
 # Windows 콘솔(cp949)에서 em-dash 등 유니코드 출력 시 크래시 방지
 sys.stdout.reconfigure(encoding="utf-8")
 
-from langchain_openai import ChatOpenAI
-from langchain_neo4j import Neo4jGraph
-
-load_dotenv()
-
-BASE_DIR = Path(__file__).resolve().parent
-SEEDS_DIR = BASE_DIR / "data" / "seeds"
-
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
-
+OPENAI_MODEL = kg.OPENAI_MODEL
 TOP_K = 3
 
 
@@ -94,6 +80,8 @@ def fetch_hypotheses(graph: Neo4jGraph, pattern: str) -> list[dict]:
 # Parameter까지 이어지면 fab 검증도 가능하다(OPTIONAL).
 # =========================
 
+# 문헌 원인(ATTRIBUTED_TO)은 5단계의 원인 표준화 덕에 백본 원인과 **같은 노드**로 합쳐져 있다.
+# 따라서 그 Cause 가 INVOLVES_PARAMETER(검증변수)를 가지면 바로 딸려 나온다(별도 우회 불필요).
 LITERATURE_QUERY = """
 MATCH (p:DefectPattern {id: $pattern})-[a:ATTRIBUTED_TO]->(c:Cause)
 OPTIONAL MATCH (c)-[ip:INVOLVES_PARAMETER]->(param:Parameter)
@@ -103,21 +91,19 @@ RETURN c.id                       AS cause,
        a.source                   AS source,
        coalesce(a.extraction_confidence, 3) AS confidence,
        param.id                   AS parameter,
-       ip.direction               AS direction,
-       a.chunk_ids                AS evidence
+       ip.direction               AS direction
 ORDER BY confidence DESC
 """
 
 
-def fetch_literature_causes(graph: Neo4jGraph, pattern: str, limit: int = 5) -> list[dict]:
+def fetch_literature_causes(graph: Neo4jGraph, pattern: str, limit: int = 6) -> list[dict]:
     rows = graph.query(LITERATURE_QUERY, params={"pattern": pattern})
-    seen, out = set(), []
+    best: dict[str, dict] = {}
     for row in rows:
-        if row["cause"] in seen:
-            continue
-        seen.add(row["cause"])
-        out.append(row)
-    return out[:limit]
+        cur = best.get(row["cause"])
+        if cur is None or (row["parameter"] and not cur["parameter"]):
+            best[row["cause"]] = row
+    return list(best.values())[:limit]
 
 
 # =========================
@@ -175,17 +161,11 @@ def synthesize(llm, pattern: str, rows: list[dict]) -> list[str]:
 # =========================
 
 def load_pattern_ids() -> list[str]:
-    data = json.loads((SEEDS_DIR / "defect_patterns.json").read_text(encoding="utf-8"))
-    return [n["id"] for n in data["nodes"]]
+    return [n["id"] for n in kg.load_seed_nodes("defect_patterns.json")]
 
 
 def main() -> None:
-    graph = Neo4jGraph(
-        url=NEO4J_URI,
-        username=NEO4J_USERNAME,
-        password=NEO4J_PASSWORD,
-        database=NEO4J_DATABASE,
-    )
+    graph = kg.get_graph()
     llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
 
     for pattern in load_pattern_ids():

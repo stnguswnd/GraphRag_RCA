@@ -17,27 +17,18 @@ Neo4j 에서 가설 경로(step, parameter, direction)를 뽑고 각각 verify()
 '가설 → 계측값 vs 정상범위 → 지지/기각'을 한 줄로 출력한다.
 """
 
-import os
 import sys
 import sqlite3
-from pathlib import Path
 
 import yaml
-from dotenv import load_dotenv
+
+import kg_common as kg
 
 # Windows 콘솔(cp949)에서 유니코드 출력 크래시 방지
 sys.stdout.reconfigure(encoding="utf-8")
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "data" / "fab" / "fab.db"
-MODEL_PATH = BASE_DIR / "data" / "fab" / "fab_model.yaml"
-
-load_dotenv(dotenv_path=BASE_DIR / ".env")
-
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")
+DB_PATH = kg.BASE_DIR / "data" / "fab" / "fab.db"
+MODEL_PATH = kg.BASE_DIR / "data" / "fab" / "fab_model.yaml"
 
 # 정상범위 로드 (그라운드 트루스). param id -> {min, max, unit}
 RANGES: dict[str, dict] = yaml.safe_load(MODEL_PATH.read_text(encoding="utf-8"))["parameters"]
@@ -197,9 +188,7 @@ def main() -> None:
     # Neo4j 연결 시도 (실패해도 폴백 가설로 데모 진행)
     graph = None
     try:
-        from langchain_neo4j import Neo4jGraph
-        graph = Neo4jGraph(url=NEO4J_URI, username=NEO4J_USERNAME,
-                           password=NEO4J_PASSWORD, database=NEO4J_DATABASE)
+        graph = kg.get_graph()
         graph.query("RETURN 1")
         print("[i] Neo4j 연결 성공 — 그래프에서 가설 경로를 조회합니다.\n")
     except Exception as e:

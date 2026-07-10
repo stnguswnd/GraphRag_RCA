@@ -168,8 +168,8 @@ Edge-Loc  ... Irregular temperature annealing ...
 > **후속(2026-07-10 2차):** 위 예시 C에서 버려졌던 `Center → 원인` 같은 지식은
 > 스키마 미스매치(`DefectPattern→Cause` 관계 부재)가 원인이었다. 이후:
 > - `2_load_txt.py`가 pdf를 **컬럼 인식**으로 추출해 표 행이 살아났고,
-> - 새 관계 `ATTRIBUTED_TO`(DefectPattern→Cause)와 `5b_extract_pattern_causes.py`로
->   논문 표의 패턴→원인을 백본에 흡수한다.
-> 즉 이 문서의 "예시 C 버림"은 이제 `5b`가 담당해 살린다. 자세한 건 `schema.md`·`STATUS.md`.
+> - 새 관계 `ATTRIBUTED_TO`(DefectPattern→Cause)로 논문 표의 패턴→원인을 담고,
+>   통합 추출기 `5_build_kg_from_chunks.py`가 원인 표준화까지 내장해 txt·pdf 원인을 한 노드로 합친다.
+> 즉 이 문서의 "예시 C 버림"은 이제 통합 `5`가 살린다. 자세한 건 `PIPELINE_FLOW.md`·`schema.md`·`STATUS.md`.
 
 > 이 문서의 예시는 `outputs/chunks.jsonl` + 확인용 스크립트(`check_pdf_extraction.py`, Neo4j 미저장)로 재현.

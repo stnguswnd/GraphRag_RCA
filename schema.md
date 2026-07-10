@@ -83,7 +83,8 @@ schema를 정적으로 만들어야 해서). 시드와 어긋나면 실행 즉�
 논문은 결함 패턴의 원인(source of defects)을 표로 직접 준다(예: "Center ← 불규칙 RF 동작").
 공정/고장모드를 거치지 않으므로 백본의 `CAUSED_BY` 경로에 담기지 않는다. 그래서 `ATTRIBUTED_TO`로
 `DefectPattern`에 바로 잇되, `source='literature'` 속성으로 fab 검증 백본(A·B)과 구분한다.
-`Cause`는 백본과 **같은 라벨을 공유**한다(도메인 이중화 방지). `5b_extract_pattern_causes.py`가 담당.
+`Cause`는 백본과 **같은 노드로 표준화**된다(도메인 이중화 방지): 통합 추출기 `5_build_kg_from_chunks.py`가
+표현이 다른 같은 원인(같은 검증변수)을 적재 전에 한 노드로 합친다. 그래서 논문 원인도 백본의 검증변수를 승계한다.
 
 ### 방향 원칙
 - `DefectPattern`과 `FailureMode`는 둘 다 `ProcessStep`으로 향한다 (join 노드로 수렴).

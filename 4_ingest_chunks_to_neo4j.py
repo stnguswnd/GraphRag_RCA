@@ -1,43 +1,17 @@
-import os
 import sys
-import json
-from pathlib import Path
 
-from dotenv import load_dotenv
-from langchain_neo4j import Neo4jGraph
+from langchain_neo4j import Neo4jGraph   # 타입 힌트용
+
+import kg_common as kg
 
 # Windows 콘솔(cp949)에서 em-dash 등 유니코드 출력 시 크래시 방지
 sys.stdout.reconfigure(encoding="utf-8")
 
+CHUNKS_PATH = kg.CHUNKS_PATH
+SEEDS_DIR = kg.SEEDS_DIR
 
-# =========================
-# 1. 환경 변수 / 경로 설정
-# =========================
-
-load_dotenv()
-
-BASE_DIR = Path(__file__).resolve().parent
-
-CHUNKS_PATH = BASE_DIR / "outputs" / "chunks.jsonl"
-SEEDS_DIR = BASE_DIR / "data" / "seeds"
-
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")
-
-
-# =========================
-# 2. Neo4j 연결
-# =========================
-
-def get_graph() -> Neo4jGraph:
-    return Neo4jGraph(
-        url=NEO4J_URI,
-        username=NEO4J_USERNAME,
-        password=NEO4J_PASSWORD,
-        database=NEO4J_DATABASE,
-    )
+get_graph = kg.get_graph          # 공용 Neo4j 핸들
+load_seed = kg.load_seed_nodes    # data/seeds/<file>.json -> nodes
 
 
 # =========================
@@ -73,14 +47,6 @@ def create_constraints(graph: Neo4jGraph) -> None:
 # ProcessStep.id  ↔ fab의 lot_history.step
 # Parameter.id    ↔ fab의 telemetry.param   (가설 검증 SQL의 join key)
 # =========================
-
-def load_seed(file_name: str) -> list[dict]:
-    path = SEEDS_DIR / file_name
-    if not path.exists():
-        raise FileNotFoundError(f"시드 파일을 찾을 수 없습니다: {path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data["nodes"]
-
 
 def seed_defect_patterns(graph: Neo4jGraph) -> None:
     nodes = load_seed("defect_patterns.json")
@@ -131,30 +97,8 @@ def seed_all_anchors(graph: Neo4jGraph) -> None:
     seed_parameters(graph)
 
 
-# =========================
-# 5. chunks.jsonl 로드
-# =========================
-
-def load_chunks(path: Path) -> list[dict]:
-    if not path.exists():
-        raise FileNotFoundError(f"chunks.jsonl 파일을 찾을 수 없습니다: {path}")
-
-    chunks = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            row = json.loads(line)
-            metadata = row.get("metadata", {})
-            chunks.append({
-                "chunk_id": row["chunk_id"],
-                "chunk_index": row["chunk_index"],
-                "text": row["page_content"],
-                "doc_id": metadata.get("doc_id"),
-                "title": metadata.get("title"),
-                "source": metadata.get("source"),
-                "start_index": metadata.get("start_index"),
-                "char_count": metadata.get("char_count"),
-            })
-    return chunks
+# chunks.jsonl 로드는 공용 kg.load_chunks 를 쓴다.
+load_chunks = kg.load_chunks
 
 
 # =========================

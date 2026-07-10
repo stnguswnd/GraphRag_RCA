@@ -35,6 +35,15 @@ Equipment ──PART_OF────────> ProcessStep                    
 **0~4단계 실행 검증 완료** (문헌 4편 → 청크 11개, 시드 3/6/20 적재, 잔재 라벨 0).
 5~6단계는 OpenAI 호출이라 미실행.
 
+**2026-07-10(3차): 통합 추출기로 재설계 — 뿌리에서 형식 무관 적재 + 원인 표준화 (branch `gus`).**
+- 사후 봉합(5b 분리 추출 + 5c 엔티티 해소)을 폐기하고, `5`를 **형식 무관 단일 추출기 + 표준화 내장**으로 재작성.
+- 어떤 문서든 같은 추출기가 담을 수 있는 걸 다 뽑고(사슬이면 사슬, 표면 패턴→원인이면 그것),
+  **적재 전에** 표현이 다른 같은 원인을 한 노드로 표준화한다(임베딩 후보 + LLM 판정, **검증변수 충돌 시 병합 금지**).
+- 결과: txt·pdf가 처음부터 같은 `Cause`를 공유. **백본+문헌+검증변수를 모두 가진 융합 Cause 6개**
+  (이전 0개). 논문 원인 'irregular RF operation'이 백본 'rf_power_drift'와 한 노드가 돼 `rf_power`로 검증됨.
+- 공용 유틸 `kg_common.py` 도입, 4/5/6/7 중복 제거. `5b`/`5c` 삭제.
+- **과병합 방어**: 표준화는 "한 클러스터에 서로 다른 검증변수가 공존 못 함"을 union-find 클러스터 제약으로 강제.
+
 **2026-07-10(2차): 학술 논문(pdf) 활용 추가 — 표 파싱 + 문헌 원인 흡수 (branch `gus`).**
 - `2_load_txt.py`: pdf를 pdfplumber **컬럼 인식**(2단 편집 좌→우, `x_tolerance=1.0`)으로 추출.
   기존 pypdf는 2단·테두리 없는 표를 뒤섞었는데, 이제 "패턴 | 원인" 행이 살아난다.
@@ -65,9 +74,12 @@ Equipment ──PART_OF────────> ProcessStep                    
 - `2_load_txt.py` — 문헌 로드(txt + **pdf 컬럼 인식 추출**) → `outputs/parsed_docs.jsonl`
 - `3_split.py` — 청킹 → `outputs/chunks.jsonl` (chunk_id = `{doc_id}#c{nn}`)
 - `4_ingest_chunks_to_neo4j.py` — 시드 앵커 3종 적재 + Chunk 적재 + NEXT_CHUNK
-- `5_build_kg_from_chunks.py` — **txt만**: FailureMode/Cause/Equipment + 4종 관계 추출, PART_OF는 규칙
-- `5b_extract_pattern_causes.py` — **pdf 논문**: 패턴→원인 표만 추출 → `DefectPattern-ATTRIBUTED_TO->Cause`
+- `kg_common.py` — 공용 유틸(Neo4j 연결·청크 로드·표기 정규화·앵커 인덱스). 4/5/6/7이 공유
+- `5_build_kg_from_chunks.py` — **통합 추출기**(형식 무관) + 원인 표준화 내장. txt/pdf 한 경로로 처리
+  (`resume` 인자로 추출 캐시 재사용, 표준화만 재실행 가능)
 - `6_ask_graphrag.py` — 결정적 순회로 가설 + 문헌 기반 후보 원인
+- `7_verify.py` — KG 가설의 Parameter를 fab 텔레메트리와 대조해 정상/이상 판정
+- `data/fab/generate_fab.py` — 검증용 목업 fab.db 생성
 
 실행 순서는 `README.md` 참조.
 
