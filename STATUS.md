@@ -14,11 +14,16 @@ data/raw/ 문헌 → 표 행 단위 청킹 → Neo4j 적재 → LLM KG 추출(+�
 
 **전 단계 실행 검증 완료.** 최신 실행 수치 (문헌 5편 → 청크 95개):
 
-| | |
+| | (v2.3, 2026-07-12 앵커 보강 후) |
 |---|---|
-| 노드 | FailureMode 103 · Cause 217 · Maintenance 106 · Recipe 20 (+시드: DefectPattern 3 · ProcessStep 6 · Parameter 20) |
-| 관계 | CAUSED_BY 210 · VERIFIED_BY 143 · OCCURS_IN 90 · ATTRIBUTED_TO 12 · ARISES_IN 3 |
-| 가설 | **총 125건** — Center 62 (자동14/반자동44/근거없음4) · Edge-Ring 53 (3/45/5) · Scratch 10 (0/7/3) |
+| 노드 | FailureMode 112 · Cause 234+ · Maintenance 108 · Recipe 20 (+시드: DefectPattern 3 · **SpatialSignature 3** · ProcessStep 6 · Parameter 20) |
+| 앵커 엣지 | ARISES_IN: Center→{CMP,DEPO,LITHO} · Edge-Ring→{CLEAN,ETCH} · Scratch→{CMP} / **FORMS_IN: ring@edge→{CLEAN,ETCH}** / ATTRIBUTED_TO 34 |
+| 가설 | **총 381건** — Center 255 (자동29/반자동117/근거없음109) · Edge-Ring 79 (5/32/42) · Scratch 47 (3/13/31) |
+
+가설 수가 는 주원인은 `[근거없음]` 노출 (공정 경유 경로의 VERIFIED_BY를 OPTIONAL로 —
+evidence 없는 원인이 통째로 사라지던 비대칭 제거). 형상 경유 가설이 표면상 0건인 것은
+현재 FORMS_IN이 닿는 공정을 ARISES_IN도 전부 덮어서 dedup이 step 경로를 대표로 남기기 때문
+(설계 의도. 형상 경로의 독립 가치는 미지 패턴 + ARISES_IN 부재 시의 fallback).
 
 질문은 `"{패턴} 결함 패턴이 나타나는 근본 원인은 무엇인가요?"` 하나로 고정.
 그래프 순회는 고정 Cypher(결정적), LLM은 경로를 한국어 가설 문장으로 옮기는 역할만.
@@ -71,6 +76,13 @@ data/raw/ 문헌 → 표 행 단위 청킹 → Neo4j 적재 → LLM KG 추출(+�
    아니라 **"agent가 스스로 판정할 수 있느냐"**.
 6. **출력 상한 제거**: `TOP_K=3` 삭제(환경변수로만 조절). dedup 키를 전체 경로로 교정해
    뭉개지던 15건 복원. 문장 합성을 배치(12건)로 나누고 부족분은 사실 기반 문장으로 채움 → 125건 전부 출력.
+7. **(07-12) v2.3 형상 레이어**: `SpatialSignature` 노드(고정 3종, (형상,구역) 쌍) +
+   `HAS_SIGNATURE`(시드 결정적) + `FORMS_IN`(문서 D 추출). 조작 문서
+   `pattern_process_extended.txt` **삭제** — 그것이 위조하던 커버리지를 Liao et al. 2026 문서
+   (문서 D, 섹션 헤딩 추가)가 정당하게 대체. **앵커 보강 패스** 도입(`ANCHOR_PASSES`, 기본 3):
+   패턴/형상 언급 청크만 K회 재추출·합집합해 진입점 엣지의 비결정성 완화(P4 부분 해소).
+   공정 경유 쿼리의 `VERIFIED_BY`를 OPTIONAL로 바꿔 evidence 없는 원인도 `[근거없음]`으로 노출
+   (direct 경로와의 비대칭 제거 — 가설 수가 크게 는 주원인).
 
 ---
 
@@ -110,9 +122,13 @@ data/raw/ 문헌 → 표 행 단위 청킹 → Neo4j 적재 → LLM KG 추출(+�
 - `chamber_wet_clean`처럼 유의미한 것과 `inspect_whether_residual_copper_cleaning_finished...`
   같은 일회성 장문 표현이 섞임. 임베딩 기반 dedup / 정규화 필요.
 
-### [P4] 추출 비결정성
-- 같은 청크에서 실행마다 결과가 다름. `Edge-Ring→DEPO`가 어떤 실행에선 나오고 어떤 실행에선 빠짐
-  (`temperature=0`으로도 안 잡힘). 다회 실행 합집합 또는 seed 고정 검토.
+### [P4] 추출 비결정성 — 앵커에 한해 완화됨
+- 같은 청크에서 실행마다 결과가 다름 (`temperature=0`으로도 안 잡힘). 실측: 한 실행에서
+  Scratch의 ARISES_IN이 전부 증발해 가설 4건으로 붕괴한 적 있음.
+- **완화**: 진입점 엣지(ARISES_IN/FORMS_IN/ATTRIBUTED_TO)는 패턴/형상 언급 청크(~19개)만
+  `ANCHOR_PASSES`회 재추출해 합집합 (5번에 내장, MERGE라 중복 없음, grounding 가드 매 패스 적용).
+- **잔여**: FailureMode/Cause/VERIFIED_BY 층은 여전히 1패스. 예: "insufficient rinsing"→`rinse_time`
+  매핑을 프롬프트에 예시까지 줬는데도 gpt-5.4-mini가 안 만든다. 모델 업그레이드 또는 전층 다회화 검토.
 
 ### [P5] 커버리지 공백
 - `CLEAN`/`EDS`: 트러블슈팅 문헌 없음 (결정: 빈 공정으로 두고 문서 추가 예정).

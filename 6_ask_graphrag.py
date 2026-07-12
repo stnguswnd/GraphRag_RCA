@@ -54,29 +54,65 @@ SYNTHESIS_BATCH = 12
 
 # evidence 3종을 :Evidence 슈퍼라벨로 한 번에 잡는다.
 # Parameter 만 telemetry 조인으로 자동 판정되고, Maintenance/Recipe 는 조회만 자동이다(반자동).
+# VERIFIED_BY는 OPTIONAL — evidence가 없는 Cause도 [근거없음] 가설로 나와야 한다.
+# (direct 경로만 evidence 없이 나오고 공정 경유는 통째로 사라지던 비대칭 제거)
 HYPOTHESIS_QUERY = """
 MATCH (p:DefectPattern {id: $pattern})-[a:ARISES_IN]->(s:ProcessStep)
 MATCH (fm:FailureMode)-[:OCCURS_IN]->(s)
 MATCH (fm)-[cb:CAUSED_BY]->(c:Cause)
-MATCH (c)-[vb:VERIFIED_BY]->(e:Evidence)
+OPTIONAL MATCH (c)-[vb:VERIFIED_BY]->(e:Evidence)
 RETURN s.id            AS step,
        fm.id           AS failure_mode,
        fm.name         AS failure_mode_name,
        c.id            AS cause,
        c.name          AS cause_name,
        c.description   AS cause_description,
-       e.id            AS evidence,
-       e.name          AS evidence_name,
+       coalesce(e.id, '근거없음')    AS evidence,
+       coalesce(e.name, '문헌 서술') AS evidence_name,
        CASE
          WHEN e:Parameter   THEN 'Parameter'
          WHEN e:Maintenance THEN 'Maintenance'
          WHEN e:Recipe      THEN 'Recipe'
-         ELSE 'Evidence'
+         ELSE 'None'
        END             AS evidence_label,
-       e.fab_table     AS fab_table,
+       coalesce(e.fab_table, '-') AS fab_table,
        vb.direction    AS direction,
        a.occurrence_prior AS occurrence_prior,
        (coalesce(a.extraction_confidence, 3)
+        + coalesce(cb.extraction_confidence, 3)
+        + coalesce(vb.extraction_confidence, 3)) / 3.0 AS confidence,
+       cb.quotes       AS quotes,
+       cb.chunk_ids    AS chunk_ids
+"""
+
+# 형상 경유 경로 (문서 D). 패턴 -> 형상은 시드에서 결정적으로 깔리고(HAS_SIGNATURE),
+# 형상 -> 공정은 문헌의 형상 수준 서술에서 추출된다(FORMS_IN).
+# 미지 패턴 대응의 기반이기도 하다: VLM이 형상만 넘겨도 signature부터 순회 가능.
+SIGNATURE_QUERY = """
+MATCH (p:DefectPattern {id: $pattern})-[:HAS_SIGNATURE]->(g:SpatialSignature)
+MATCH (g)-[f:FORMS_IN]->(s:ProcessStep)
+MATCH (fm:FailureMode)-[:OCCURS_IN]->(s)
+MATCH (fm)-[cb:CAUSED_BY]->(c:Cause)
+OPTIONAL MATCH (c)-[vb:VERIFIED_BY]->(e:Evidence)
+RETURN g.id            AS signature,
+       s.id            AS step,
+       fm.id           AS failure_mode,
+       fm.name         AS failure_mode_name,
+       c.id            AS cause,
+       c.name          AS cause_name,
+       c.description   AS cause_description,
+       coalesce(e.id, '근거없음')    AS evidence,
+       coalesce(e.name, '문헌 서술') AS evidence_name,
+       CASE
+         WHEN e:Parameter   THEN 'Parameter'
+         WHEN e:Maintenance THEN 'Maintenance'
+         WHEN e:Recipe      THEN 'Recipe'
+         ELSE 'None'
+       END             AS evidence_label,
+       coalesce(e.fab_table, '-') AS fab_table,
+       vb.direction    AS direction,
+       f.occurrence_prior AS occurrence_prior,
+       (coalesce(f.extraction_confidence, 3)
         + coalesce(cb.extraction_confidence, 3)
         + coalesce(vb.extraction_confidence, 3)) / 3.0 AS confidence,
        cb.quotes       AS quotes,
@@ -154,20 +190,30 @@ LEGEND = """검증 등급 — 'fab.db에 있느냐'가 아니라 '에이전트�
   [근거없음] 검증 신호가 없는 문헌 서술. fab 데이터로 확인할 수 없습니다."""
 
 
+# 같은 (공정, 고장, 원인, 신호) 꼬리를 두 경로가 모두 찾으면 한 가설로 합치되,
+# 패턴을 직접 지목한 문헌(step)이 형상 서술(signature)보다 강한 근거다.
+ROUTE_RANK = {"step": 2, "signature": 1, "direct": 0}
+
+
 def fetch_hypotheses(graph: Neo4jGraph, pattern: str) -> list[dict]:
     rows = graph.query(HYPOTHESIS_QUERY, params={"pattern": pattern})
     for row in rows:
         row["route"] = "step"
+    for row in graph.query(SIGNATURE_QUERY, params={"pattern": pattern}):
+        row["route"] = "signature"
+        rows.append(row)
     rows += graph.query(DIRECT_QUERY, params={"pattern": pattern})
 
-    # 완전히 같은 경로만 합친다. (원인, 검증신호)로만 묶으면 서로 다른 공정·고장 모드를 거친
-    # 별개의 가설이 하나로 뭉개진다. 예: 같은 rf_power가 ETCH와 DEPO 양쪽에서 나올 수 있다.
+    # 완전히 같은 경로 꼬리만 합친다. (원인, 검증신호)로만 묶으면 서로 다른 공정·고장 모드를
+    # 거친 별개의 가설이 하나로 뭉개진다. route는 키에서 뺀다 — step 경유와 signature 경유가
+    # 같은 꼬리에 닿으면 같은 가설이고, 더 강한 경로(ROUTE_RANK)의 것을 대표로 남긴다.
     best: dict[tuple, dict] = {}
     for row in rows:
+        row.setdefault("signature", None)
         row["tier"] = TIER_OF_LABEL.get(row["evidence_label"], TIER_NONE)
-        key = (row["route"], row["step"], row["failure_mode"], row["cause"], row["evidence"])
+        key = (row["step"], row["failure_mode"], row["cause"], row["evidence"])
         prior = PRIOR_RANK.get(row["occurrence_prior"], 1)
-        row["_score"] = (row["tier"], prior, row["confidence"])
+        row["_score"] = (row["tier"], prior, row["confidence"], ROUTE_RANK[row["route"]])
         if key not in best or row["_score"] > best[key]["_score"]:
             best[key] = row
 
@@ -206,6 +252,7 @@ SYNTHESIS_PROMPT = """
   [반자동] Recipe면 "사용된 레시피를 확인해야 합니다"로 쓰세요.
 - 검증 신호가 [근거없음]이면 "fab 데이터로는 확인할 수 없어 문헌 근거로만 남습니다"라고 덧붙이세요.
 - 경로가 "문헌 직결"이면 공정을 언급하지 말고, 문헌이 이 패턴의 원인으로 지목했다고 쓰세요.
+- 경로가 "형상 경유"이면 "이 패턴의 형상(예: 가장자리 링)이 주로 X 공정에서 생긴다는 문헌 근거"임을 밝히세요.
 - 문장 앞에 번호를 붙이지 마세요.
 """
 
@@ -225,6 +272,12 @@ def describe_path(row: dict) -> str:
 
     if row["route"] == "direct":
         head = "- 경로: 문헌이 패턴에서 원인을 바로 지목 (공정 미상)\n"
+    elif row["route"] == "signature":
+        head = (
+            f"- 경로: 형상 경유 — 문헌이 형상({row['signature']})으로 공정을 지목\n"
+            f"  공정: {row['step']}\n"
+            f"  고장 모드: {row['failure_mode_name']} ({row['failure_mode']})\n"
+        )
     else:
         head = (
             f"- 공정: {row['step']}\n"
@@ -360,6 +413,14 @@ def main() -> None:
                 trail = f"{pattern} -[ATTRIBUTED_TO]-> {row['cause']}"
                 if row["evidence_label"] != "None":
                     trail += f" -[VERIFIED_BY]-> ({row['evidence_label']}) {row['evidence']}"
+            elif row["route"] == "signature":
+                trail = (
+                    f"{pattern} -[HAS_SIGNATURE]-> {row['signature']}"
+                    f" -[FORMS_IN]-> {row['step']}"
+                    f" <-[OCCURS_IN]- {row['failure_mode']}"
+                    f" -[CAUSED_BY]-> {row['cause']}"
+                    f" -[VERIFIED_BY]-> ({row['evidence_label']}) {row['evidence']}"
+                )
             else:
                 trail = (
                     f"{pattern} -[ARISES_IN]-> {row['step']}"
@@ -390,6 +451,7 @@ def main() -> None:
                 "route": row["route"],                     # step=공정 경유, direct=문헌 직결
                 "path": {
                     "pattern": pattern,
+                    "signature": row["signature"],   # 형상 경유일 때만, 아니면 null
                     "step": row["step"],
                     "failure_mode": row["failure_mode"],
                     "cause": row["cause"],

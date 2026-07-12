@@ -51,6 +51,13 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
 #   문헌이 공정을 거치지 않고 패턴 -> 원인을 바로 말할 때 쓴다.
 #   이 Cause는 공정을 모르므로 Parameter(자동 검증)에 닿지 못한다. 수동 확인 대상이다.
 #
+#   SpatialSignature -[FORMS_IN]-> ProcessStep     (문서 D: 형상 수준 서술)
+#   "ring-shaped pattern at the outer edge reflects issues in cleaning steps"처럼
+#   문헌이 패턴 클래스명 없이 형상으로 말할 때 쓴다.
+#   DefectPattern -[HAS_SIGNATURE]-> SpatialSignature 는 시드에서 결정적으로 깔리므로(4번),
+#   FORMS_IN만 이어지면 패턴 -> 형상 -> 공정 경로가 열린다.
+#   미지 패턴(3클래스 외)도 VLM이 형상만 넘기면 이 경로로 가설을 얻는다.
+#
 # 세 evidence 라벨은 공통 슈퍼라벨 :Evidence 를 함께 갖는다.
 # Parameter 만 fab SQL로 자동 검증되고(telemetry.param 조인),
 # Maintenance/Recipe 는 조회 힌트라 수동 확인 대상이다.
@@ -60,6 +67,9 @@ ProcessStepId = Literal["LITHO", "ETCH", "DEPO", "CMP", "CLEAN", "EDS"]
 
 # seeds/defect_patterns.json 과 반드시 동일. id == VLM 출력 클래스
 DefectPatternId = Literal["Center", "Scratch", "Edge-Ring"]
+
+# seeds/signatures.json 과 반드시 동일. (형상@구역) 쌍. VLM 형상 라벨과 정렬 예정
+SpatialSignatureId = Literal["cluster@center", "ring@edge", "line@any"]
 
 # seeds/parameters.json 과 반드시 동일. id == fab telemetry.param
 ParameterId = Literal[
@@ -72,11 +82,12 @@ ParameterId = Literal[
 ]
 
 RelationshipKind = Literal[
-    "ARISES_IN",       # DefectPattern -> ProcessStep
-    "ATTRIBUTED_TO",   # DefectPattern -> Cause   (공정을 거치지 않는 직결 서술)
-    "OCCURS_IN",       # FailureMode   -> ProcessStep
-    "CAUSED_BY",       # FailureMode   -> Cause
-    "VERIFIED_BY",     # Cause         -> Parameter | Maintenance | Recipe
+    "ARISES_IN",       # DefectPattern    -> ProcessStep
+    "FORMS_IN",        # SpatialSignature -> ProcessStep  (형상 수준 서술)
+    "ATTRIBUTED_TO",   # DefectPattern    -> Cause   (공정을 거치지 않는 직결 서술)
+    "OCCURS_IN",       # FailureMode      -> ProcessStep
+    "CAUSED_BY",       # FailureMode      -> Cause
+    "VERIFIED_BY",     # Cause            -> Parameter | Maintenance | Recipe
 ]
 
 # VERIFIED_BY의 대상 라벨. 다형 관계라 LLM이 라벨을 함께 지목해야 한다.
@@ -91,6 +102,7 @@ FAB_TABLE = {
 
 PROCESS_STEP_IDS: set[str] = set(get_args(ProcessStepId))
 DEFECT_PATTERN_IDS: set[str] = set(get_args(DefectPatternId))
+SIGNATURE_IDS: set[str] = set(get_args(SpatialSignatureId))
 PARAMETER_IDS: set[str] = set(get_args(ParameterId))
 
 
@@ -103,6 +115,7 @@ def assert_enums_match_seeds() -> None:
     pairs = [
         ("defect_patterns.json", DEFECT_PATTERN_IDS),
         ("process_steps.json", PROCESS_STEP_IDS),
+        ("signatures.json", SIGNATURE_IDS),
         ("parameters.json", PARAMETER_IDS),
     ]
     for file_name, enum_ids in pairs:
@@ -144,6 +157,7 @@ def _build_alias_index(file_name: str) -> dict[str, str]:
 
 DEFECT_PATTERN_INDEX = _build_alias_index("defect_patterns.json")
 PROCESS_STEP_INDEX = _build_alias_index("process_steps.json")
+SIGNATURE_INDEX = _build_alias_index("signatures.json")
 
 
 def resolve_anchor(raw: str, index: dict[str, str]) -> Optional[str]:
@@ -215,6 +229,31 @@ def resolve_parameter(raw: str, steps: set[str]) -> tuple[Optional[str], str]:
     if len(hits) > 1:
         return None, f"공정 {sorted(steps)}에서 '{raw}'가 {sorted(hits)} 여럿을 가리켜 모호함"
     return None, f"'{raw}'는 공정 {sorted(steps)}에서 계측되지 않는 변수"
+
+
+# =========================
+# 2.3 앵커 보강 패스 (추출 비결정성 완화)
+# -------------------------
+# ARISES_IN / FORMS_IN / ATTRIBUTED_TO 는 그래프의 진입점인데, 같은 청크라도
+# 실행마다 LLM이 뽑았다 안 뽑았다 한다(temperature=0으로도 안 잡힘).
+# 패턴/형상을 언급하는 청크만 골라 K회 재추출해 합집합을 취한다.
+# 저장이 MERGE라 중복은 안 생기고, 빠졌던 엣지만 채워진다.
+# 검증 규칙(grounding 등)은 매 패스 동일하게 적용되므로 환각이 늘지는 않는다.
+# =========================
+
+ANCHOR_PASSES = int(os.getenv("ANCHOR_PASSES", "3"))
+
+_ANCHOR_RE = re.compile(
+    r"\b(" + "|".join(
+        re.escape(s) for s in
+        sorted(set(_build_alias_index("defect_patterns.json"))
+               | set(_build_alias_index("signatures.json")), key=len, reverse=True)
+    ) + r")\b"
+)
+
+
+def mentions_pattern_or_signature(text: str) -> bool:
+    return bool(_ANCHOR_RE.search(_normalize_key(text)))
 
 
 # canonical ProcessStep id -> 그 공정을 가리키는 모든 표기 (근거 확인용 역방향 맵)
@@ -372,6 +411,13 @@ def build_prompt(chunk: dict) -> str:
   (웨이퍼맵 상의 공간 패턴만 해당. "circular ring"→Edge-Ring, "bulls eye"→Center,
    "linear defect"/"scuff mark"→Scratch)
 
+공간 시그니처(SpatialSignature) 3종 — "{{형상}}@{{구역}}" 쌍:
+  cluster@center, ring@edge, line@any
+  (문헌이 패턴 클래스명 없이 형상으로 말할 때 사용.
+   "ring-shaped pattern at the outer edge"→ring@edge,
+   "concentrated cluster near the center"→cluster@center,
+   "linear streaks"/"directional scratches"→line@any)
+
 공정 변수(Parameter) 20종:
   exposure_dose, focus_offset, stage_temp, alignment_offset,
   rf_power, chamber_pressure, he_flow, temperature, etch_rate,
@@ -390,8 +436,14 @@ Maintenance와 Recipe는 문헌 표현으로 자유롭게 만드세요.
 - Maintenance : 정비 행위. 조치 문장에서 뽑는다. (예: chamber wet clean, replace defective thermocouple)
 - Recipe      : 레시피 확인 대상. (예: process recipe)
 
-관계(kind) 5종:
+관계(kind) 6종:
 - ARISES_IN:     (DefectPattern) -> (ProcessStep)  "이 불량 패턴은 이 공정을 의심케 한다" (occurrence_prior 채우기)
+- FORMS_IN:      (SpatialSignature) -> (ProcessStep)  "이 형상은 주로 이 공정에서 생긴다" (occurrence_prior 채우기)
+                 문헌이 패턴 클래스명 없이 **형상 서술**로 공정을 지목할 때 씁니다.
+                 예: "This ring-shaped failure pattern at the outer edge reflects issues in cleaning steps"
+                     -> FORMS_IN: ring@edge -> CLEAN
+                 같은 문장이 패턴 클래스명(Center/Scratch/Edge-Ring)도 함께 말하면
+                 ARISES_IN을 우선하고 FORMS_IN은 만들지 마세요(중복 방지).
 - ATTRIBUTED_TO: (DefectPattern) -> (Cause)        "이 불량 패턴의 원인은 저것이다"
                  문헌이 **공정을 말하지 않고** 패턴에서 원인으로 바로 건너뛸 때 씁니다.
 - OCCURS_IN:   (FailureMode)   -> (ProcessStep)  "이 고장 모드는 이 공정에서 일어난다" (고장 모드마다 정확히 1개)
@@ -403,6 +455,10 @@ Maintenance와 Recipe는 문헌 표현으로 자유롭게 만드세요.
 
 VERIFIED_BY 대상 고르는 법:
 - 원인이 계측 변수의 이상이면      -> Parameter  (예: "RF power drift" -> rf_power)
+  양의 과부족을 말하는 원인도 여기 해당합니다. direction으로 방향을 적으세요.
+    "insufficient rinsing"        -> Parameter rinse_time (direction=low)
+    "excessive down force"        -> Parameter down_force (direction=high)
+    "localized over-pressure"     -> Parameter down_force (direction=high, CMP 문맥)
 - 원인이 정비 부족/부품 열화면      -> Maintenance (예: "improper maintenance" -> chamber wet clean)
 - 원인이 잘못된 레시피면            -> Recipe     (예: "incorrect process recipe" -> process recipe)
 
@@ -492,6 +548,15 @@ def validate_kg(
             tgt = resolve_anchor(tgt, PROCESS_STEP_INDEX)
             if src is None or tgt is None:
                 log.append(f"{raw}: 앵커 매핑 실패 (DefectPattern/ProcessStep)")
+                continue
+            if chunk_text and not step_is_grounded_in(tgt, chunk_text):
+                log.append(f"{raw}: 청크 원문에 공정 '{tgt}' 언급 없음 (환각)")
+                continue
+        elif rel.kind == "FORMS_IN":
+            src = resolve_anchor(src, SIGNATURE_INDEX)
+            tgt = resolve_anchor(tgt, PROCESS_STEP_INDEX)
+            if src is None or tgt is None:
+                log.append(f"{raw}: 앵커 매핑 실패 (SpatialSignature/ProcessStep)")
                 continue
             if chunk_text and not step_is_grounded_in(tgt, chunk_text):
                 log.append(f"{raw}: 청크 원문에 공정 '{tgt}' 언급 없음 (환각)")
@@ -722,6 +787,23 @@ def save_kg_to_neo4j(graph: Neo4jGraph, kg: RcaGraph, chunk: dict) -> None:
         params={"rels": rels, "chunk_id": chunk_id},
     )
 
+    # (4a) FORMS_IN : SpatialSignature -> ProcessStep  (문서 D, 형상 수준 서술)
+    graph.query(
+        f"""
+        UNWIND $rels AS r
+        WITH r WHERE r.kind = 'FORMS_IN'
+        MATCH (g:SpatialSignature {{id: r.source}})
+        MATCH (s:ProcessStep {{id: r.target}})
+        MERGE (g)-[rel:FORMS_IN]->(s)
+        SET rel.occurrence_prior = r.occurrence_prior,
+            rel.extraction_confidence = r.extraction_confidence,
+            rel.description = r.description,
+            rel.quotes = r.quotes,
+        {_CHUNK_IDS_SET}
+        """,
+        params={"rels": rels, "chunk_id": chunk_id},
+    )
+
     # (4b) ATTRIBUTED_TO : DefectPattern -> Cause  (문서 C, 공정을 거치지 않는 직결)
     graph.query(
         f"""
@@ -881,6 +963,24 @@ def main() -> None:
         totals["maintenance"] += len(kg.maintenance)
         totals["recipes"] += len(kg.recipes)
         totals["relationships"] += len(kg.relationships)
+
+    # 앵커 보강: 패턴/형상을 언급하는 청크만 K-1회 재추출해 합집합 (MERGE라 중복 없음)
+    anchor_chunks = [c for c in chunks if mentions_pattern_or_signature(c["text"])]
+    for pass_no in range(2, ANCHOR_PASSES + 1):
+        print("=" * 80)
+        print(f"앵커 보강 패스 {pass_no}/{ANCHOR_PASSES} — 대상 {len(anchor_chunks)}청크")
+        for chunk in anchor_chunks:
+            kg = extract_kg_from_chunk(structured_llm, chunk)
+            dropped = []
+            kg = validate_kg(kg, dropped, chunk_text=chunk["text"])
+            save_kg_to_neo4j(graph, kg, chunk)
+            anchors = [
+                f"{r.kind} {r.source}->{r.target}"
+                for r in kg.relationships
+                if r.kind in ("ARISES_IN", "FORMS_IN", "ATTRIBUTED_TO")
+            ]
+            if anchors:
+                print(f"  {chunk['chunk_id']}: {anchors}")
 
     graph.refresh_schema()
 

@@ -18,17 +18,17 @@ data/raw/ 문헌 (표·산문)
   -> 결정적 순회 + 가설 출력 (6_ask_graphrag.py)  -> stdout + outputs/hypotheses.json
 ```
 
-## 그래프 구조 (schema v2.2)
+## 그래프 구조 (schema v2.3)
 
 ```text
                 ┌──ATTRIBUTED_TO───────────────────────────┐   (문헌이 공정을 안 밝힐 때)
                 │                                           ▼
 DefectPattern ──ARISES_IN──> ProcessStep <──OCCURS_IN── FailureMode
  (Edge-Ring)                   (ETCH)        (join)   (incorrect_etch_rate)
-                                                            │ CAUSED_BY
-                                                            ▼
-                                                          Cause
-                                                            │ VERIFIED_BY
+     │ HAS_SIGNATURE (시드)      ▲                          │ CAUSED_BY
+     ▼                          │                          ▼
+SpatialSignature ──FORMS_IN─────┘                        Cause
+ (ring@edge)   (문헌이 형상으로 말할 때)                     │ VERIFIED_BY
                                      ┌──────────────────────┼──────────────────────┐
                                      ▼                      ▼                      ▼
                                 Parameter              Maintenance              Recipe
@@ -40,8 +40,10 @@ DefectPattern ──ARISES_IN──> ProcessStep <──OCCURS_IN── FailureM
 - **join 노드:** `ProcessStep` — 패턴 문서와 troubleshooting 문서가 만나는 지점
 - **검증 종착점:** `:Evidence` (Parameter / Maintenance / Recipe, `fab_table` 프로퍼티로 조회 대상 명시)
 
-가설 1건 = 경로 1개. 두 갈래가 있다:
+가설 1건 = 경로 1개. 세 갈래가 있다:
 `DefectPattern → ProcessStep → FailureMode → Cause → Evidence` (공정 경유),
+`DefectPattern → SpatialSignature → ProcessStep → ...` (형상 경유 — 문헌이 패턴명 없이
+"ring-shaped pattern at the edge"처럼 형상으로 말할 때. 미지 패턴도 VLM이 형상만 넘기면 순회 가능),
 `DefectPattern → Cause` (문헌 직결, `ATTRIBUTED_TO`).
 
 **검증 등급** — "fab.db에 있느냐"가 아니라 **"agent가 스스로 판정할 수 있느냐"**로 가른다:
@@ -136,9 +138,12 @@ data/
     Semiconductor Devices..._troubleshootingTABLE.md
                                        문서 B: 교과서 트러블슈팅 표 82행 (FailureMode -> Cause -> Evidence)
     ref56_table1_pattern_causes.md     문서 C: 논문 Table 1, 패턴 -> 원인 직결 (ATTRIBUTED_TO)
+    Wafer defect semantic reasoning....txt
+                                       문서 D: Liao et al. 2026, 패턴/형상 -> 공정 (ARISES_IN, FORMS_IN)
     _reference/                        교과서 본문 339KB — 로더가 읽지 않음
   seeds/    고정 vocabulary (문헌에서 뽑지 않고 미리 적재하는 앵커)
-    defect_patterns.json   3종   VLM 출력 클래스와 일치해야 함
+    defect_patterns.json   3종   VLM 출력 클래스와 일치해야 함 (signatures 필드 -> HAS_SIGNATURE 시딩)
+    signatures.json        3종   (형상@구역) 쌍. VLM 형상 라벨과 정렬 필요
     process_steps.json     6종   join key: lot_history.step
     parameters.json       20종   join key: telemetry.param  (steps 필드 = 별칭 해석 스코프)
 ```
@@ -155,4 +160,6 @@ canonical id에 치환된 뒤 `MATCH`로만 붙으므로, 시드 밖 노드는 �
 ## 현재 상태
 
 진행 상황·남은 문제·다음 작업은 [`STATUS.md`](STATUS.md) 참조.
-최신 실행: 문헌 5편 → 청크 95개 → 가설 **125건** (Center 62 / Edge-Ring 53 / Scratch 10).
+최신 실행: 문헌 6편 → 청크 105개 → 가설 **381건** (Center 255 / Edge-Ring 79 / Scratch 47).
+진입점 엣지(ARISES_IN/FORMS_IN/ATTRIBUTED_TO)는 추출 비결정성 완화를 위해
+패턴/형상 언급 청크만 `ANCHOR_PASSES`(기본 3)회 재추출해 합집합한다.

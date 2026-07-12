@@ -1,0 +1,26 @@
+{
+  "_comment": "(:SpatialSignature) 시드 - 고정 vocabulary (4번째 앵커). id는 '{shape}@{zone}' 형식. 형상 단독이 아니라 (형상,구역) 쌍인 이유: 패턴 9종 확장 시 Edge-Ring(ring@edge)과 Donut(ring@mid)이 한 노드로 뭉개지는 것을 막기 위함. ⚠ id는 VLM이 출력하는 형상/구역 라벨과 정렬 필요 - VLM 라벨 집합 확정 시 재검토할 것. 이 목록을 바꾸면 5_build_kg_from_chunks.py의 SpatialSignatureId Literal도 함께 바꿔야 한다(assert가 잡아줌). DefectPattern→HAS_SIGNATURE 연결은 defect_patterns.json의 signatures 필드에서 4번이 결정적으로 시딩한다(LLM 불개입).",
+  "nodes": [
+    {
+      "id": "cluster@center",
+      "name": "cluster@center",
+      "shape": "cluster",
+      "zone": "center",
+      "aliases": ["concentrated cluster near the center", "center cluster", "cluster at center", "blob at center", "bulls eye", "center-weighted signature", "concentrated in the central region"]
+    },
+    {
+      "id": "ring@edge",
+      "name": "ring@edge",
+      "shape": "ring",
+      "zone": "edge",
+      "aliases": ["ring-shaped pattern at the outer edge", "ring at the edge", "circular ring along the edge", "peripheral ring", "ring near the wafer edge", "edge ring shape", "annular pattern at the periphery"]
+    },
+    {
+      "id": "line@any",
+      "name": "line@any",
+      "shape": "line",
+      "zone": "any",
+      "aliases": ["linear streaks", "directional scratches", "linear scratch marks", "elongated line", "line across the wafer", "scratch-like traces", "linear defect trace"]
+    }
+  ]
+}
