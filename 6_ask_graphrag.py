@@ -71,6 +71,7 @@ RETURN s.id            AS step,
        c.id            AS cause,
        c.name          AS cause_name,
        c.description   AS cause_description,
+       c.unverifiable_signals AS unverifiable_signals,
        coalesce(e.id, '근거없음')    AS evidence,
        coalesce(e.name, '문헌 서술') AS evidence_name,
        CASE
@@ -106,6 +107,7 @@ RETURN g.id            AS signature,
        c.id            AS cause,
        c.name          AS cause_name,
        c.description   AS cause_description,
+       c.unverifiable_signals AS unverifiable_signals,
        coalesce(e.id, '근거없음')    AS evidence,
        coalesce(e.name, '문헌 서술') AS evidence_name,
        CASE
@@ -137,6 +139,7 @@ RETURN 'direct'        AS route,
        c.id            AS cause,
        c.name          AS cause_name,
        c.description   AS cause_description,
+       c.unverifiable_signals AS unverifiable_signals,
        coalesce(e.id, '근거없음')    AS evidence,
        coalesce(e.name, '문헌 서술') AS evidence_name,
        CASE
@@ -629,6 +632,9 @@ def main() -> None:
                 )
             else:
                 print("   검증: [근거없음] fab 데이터에 연결되지 않음. 문헌 서술로만 존재합니다")
+                if row.get("unverifiable_signals"):
+                    print(f"          문헌이 지목한 신호(fab 계측 없음): "
+                          f"{', '.join(row['unverifiable_signals'])} — 부족한 데이터로 기록(C2)")
                 if mapping:
                     hint = f"param={mapping['param']}" if mapping["param"] not in (None, "none") \
                         else f"process={mapping['process']} (이력 단서)"
@@ -656,6 +662,9 @@ def main() -> None:
                 "verification": {
                     "fab_table": None if row["fab_table"] == "-" else row["fab_table"],
                     "direction": row["direction"],
+                    # 문헌이 지목했지만 fab 어휘에 없어 붙이지 못한 신호 (C2 성격 —
+                    # '지식 없음'이 아니라 '계측 없음'. agent는 부족한 데이터란에 기록 권장)
+                    "unverifiable_signals": row.get("unverifiable_signals") or None,
                 },
                 # 순위 성분 — 전부 측정값. LLM 자기평가(confidence)와 검증 등급(tier)은
                 # 그럴듯함의 근거가 아니므로 점수에 넣지 않는다.

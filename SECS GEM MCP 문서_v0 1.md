@@ -1,10 +1,6 @@
-# SECS/GEM MCP 문서_v0.1 (작업중)
-
-생성 일시: 2026년 7월 10일 오후 10:32
-생성자: 허수정
-최종 편집 일시: 2026년 7월 11일 오후 4:11
-
 # 1. Tool 명세
+
+- Tool별 코드: `secsgem-mcp/server/tools/*.py` 참고
 
 | 공통
 사용
@@ -150,7 +146,7 @@ A6. 소모품 수명 / 교체 이력 검증 (Scratch 특화)
     | --- | --- | --- | --- |
     | **Center** | **증착 챔버 중심부 불균일 — 샤워헤드 막힘 (55%)** | **A1(step=증착) → A3(유량/압력) → A4** | **증착 장비 텔레메트리 드리프트** |
     | Center | CMP 중심 과연마 (25%) | A1(step=CMP) → A3(연마 압력/패드) → A2 | CMP 파라미터 or 정비 직후 시점 |
-    | Center | 세정 노즐 중심 분사 이상 (20%) | A1(step=세정) → A4 → A2 | 세정 장비 알람/BM 이력 |
+    | ~~Center~~ | ~~세정 노즐 중심 분사 이상 (20%)~~ | ~~A1(step=세정) → A4 → A2~~ | ~~세정 장비 알람/BM 이력~~ |
     | **Edge-Ring** | **식각 불균일 — 에지 플라즈마 밀도 (60%)** | **A1(step=식각) → A3(RF power/압력) → A4** | **etcher chamber 텔레메트리** |
     | Edge-Ring | CMP 엣지 과연마 (25%) | A1(step=CMP) → A3 → A2 | CMP 정비(패드 교체) 선후 |
     | Edge-Ring | 세정 문제 (15%) | A1(step=세정) → A4 → A2 | 세정 알람/정비 |
@@ -164,7 +160,7 @@ A6. 소모품 수명 / 교체 이력 검증 (Scratch 특화)
                 - Thin-film Deposition(박막 증착)
                 - Chemical Mechanical Polishing (CMP, 화학적 기계적 연마)
                 - Photolithography Alignment (웨이퍼의 회로 패턴을 새기는 단계)
-                - Cleaning Processes (세정(Wet/Dry Cleaning) 단계)
+                - ~~Cleaning Processes (세정(Wet/Dry Cleaning) 단계)~~
             - 메커니즘
                 - Thin-film Deposition(박막 증착) 관련
                     - 증착 과정에서의 변동성(variations)이나 균일하지 않은 도포(non-uniformities)가 발생하면, 웨이퍼 중심부의 표면 결함이나 박막 두께에 불일치가 생길 수 있음
@@ -173,13 +169,13 @@ A6. 소모품 수명 / 교체 이력 검증 (Scratch 특화)
                     - 특히 웨이퍼의 평탄도(planarity)를 일정하게 유지하는 것이 중요한 중심 영역에서 이러한 연마 불균형이 집중적인 결함으로 나타남
                 - Photolithography Alignment 관련
                     - 웨이퍼의 회로 패턴을 새기는 단계에서, 특히 웨이퍼 중심 부근에서 패턴 왜곡(pattern distortions)이나 오버레이(overlay) 오류가 생길 수 있음
-                - 세정 관련
-                    - 세정 과정 중 잔류물(Residues)이나 입자들이 제거되지 않고 남아있는 상태에서, 웨이퍼 표면을 스치고 지나가며 긁힘을 만듦
+                - ~~세정 관련~~
+                    - ~~세정 과정 중 잔류물(Residues)이나 입자들이 제거되지 않고 남아있는 상태에서, 웨이퍼 표면을 스치고 지나가며 긁힘을 만듦~~
         - Edge-Ring
             - 특징: 웨이퍼의 가장자리(perimeter)를 따라 링 형태의 불량 패턴이 나타남
             - 추론 원인 공정 단계
                 - Etching(식각)
-                - Edge-bead removal(엣지 비드 제거)
+                - ~~Edge-bead removal(엣지 비드 제거)~~
                 - Cleaning Processe
             - 메커니즘
                 - 공정 단계에서의 결함이나 일관성 부족이 웨이퍼 테두리 근처에 오염 또는 물리적 손상을 발생시키며, 이것이 가장자리를 따라 원형의 결함 분포를 형성한다고 설명
@@ -382,11 +378,168 @@ E5
 | T8 `detect_change_points` |  |  | ● | ○ |  | ● |  |  | ○ |  |  |  |
 | T9 `get_lot_timeline` |  |  | ○ | ○ | ○ |  | ○ |  | ● |  | ● |  |
 
-# 5. End-to-End 예시
+# 5. End-to-End 샘플 시나리오
+
+## 5.1 Center
 
 <aside>
 📌
 
-- 결함 패턴: Edge-Ring
-- 
+- 데이터 설계
+    - 진짜 원인은 “증착 챔버 중심부 불균일 (샤워헤드 막힘, 누적형 드리프트)”
+    : CVD-03/CH-A의 샤워헤드 막힘
+        - `shower_flow`가 정비 이벤트없이 점진 하강하는 누적형 드리프트(A1(step=증착) → A3(유량/압력) → A4)
+        - 함정으로
+            - (a) CVD-03에 무관 배경 알람 `HEATER_TEMP_DEV`가 전 기간 산발 주입(교란 신호)
+            - (b) CLEAN-01은 불량 lot 다수가 통과하지만 정상 lot도 대량 통과(negative evidence 함정)
+- 총 툴 호출 ~19회(T2 병렬 10회 포함)
+- 원인이 이벤트형(PM)이 아닌 누적형이므로 시작점 근거가 T7 정비 이력이 아니라 T8 변화점이고, 임계 기반 알람(FLOW_LOW)이 드리프트에 크게 후행함을 보여줌
+- "알람 기준치 ≠ 이상치"를 에이전트가 텔레메트리로 보완해야 하는 전형적인 사례임
+- A1의 두 호출 패턴(시퀀스 1 step 지정 1차 → 시퀀스 2step 미지정 재호출)도 함께 커버함
 </aside>
+
+1. T1 get_wafer_map(L3108, 12) → VLM: "Center, 웨이퍼 중심부에 불균일한 결함"
+2. KG 질의 (MCP 밖) → 후보: 샤워헤드 막힘 / CMP 중심 과연마 / 세정 노즐 분사 이상
+3. T2 ×10 (불량 lot 10개 이력) ∥ 병렬
+4. T3 run_commonality_analysis(10 lots,
+step=증착) → CVD-03/CH-A 9/10 (90%) [A1 → KG 최우선 후보 공정으로 1차 축소]
+    
+    → 가설 H1: CVD-03/CH-A 샤워헤드 막힘
+    
+5. T4 get_normal_lot_ratio(CVD-03/CH-A) → 통과 62 lot 중 불량 13 (배경 불량률의 5배) [B1 → 가설 유지 결정]
+6. T5 query_telemetry(CVD-03, D-30..D-1,
+params=[shower_flow, pressure]) → shower_flow 완만 하강, D-12부터 정상 범위 이탈
+coverage.missing: "D-22~D-21 텔레메트리 결측" [A3]
+7. T8 detect_change_points(
+metric=shower_flow, scope=CVD-03) → 변화점 D-25, 인접 이벤트 없음(PM/recipe 무관) [A3 → 시작점 특정]
+8. T6 get_alarm_history(CVD-03, D-30..D-1)→ FLOW_LOW D-8부터 (드리프트보다 17일 후행 → 임계 기반 알람의 한계) + HEATER_TEMP_DEV 전 기간 산발 [A4]
+9. HEATER_TEMP_DEV에 B3 3문항 → 정상 범위 내 변동 + KG 메커니즘 경로 없음
+    
+    → "배제된 신호"로 기록만 [B3 → 배제된 신호로 기록 (함정(a)에 해당)]
+    
+10. T9 get_lot_timeline(L3108) → 드리프트 시작(D-25) < 불량 lot 증착(D-16~D-4) [B2 → 시간 정합성 통과]
+    
+    → 가설 H2: CMP 중심 과연마 / H3: 세정 노즐
+    
+11. T3 run_commonality_analysis(10 lots) → step 미지정 전체 재호출: CLEAN-01 8/10 (80%), CMP 계열 분산(최대 4/10) [A1 분기 → H2 몰림 없음 → 약화]
+12. T4 get_normal_lot_ratio(CLEAN-01) → 통과 195 lot 중 불량 9 (배경 수준) [B1 → H3 기각 결정 (함정(b)에 해당)]
+13. evidence table 조립:
+H1 지지: commonality 90%(step=증착) / D-25 시작 드리프트 및 D-12 범위 이탈 / FLOW_LOW 동시성 / 시간 정합
+반대: 없음 미확인: D-22~D-21 결측(coverage.missing) 배제: HEATER_TEMP_DEV(B3)
+H2 지지 없음(몰림 없음) → 약화 H3 반대: 정상 lot 다수 통과 → 기각
+14. Critic: D1 (T9 재확인, 통과) / D2 (T4 기록 존재+재호출 일치, 통과)
+/ D3 (missing 미인용, 배제 신호 기록 존재, KG 메커니즘 문장 존재, 통과)
+→ 채택: "CVD-03 CH-A 샤워헤드 막힘 (증착 사이클 누적에 따른 유량 점진 저하)"
+    - 다음 확인 항목: D-22~D-21 결측 구간 확보, 샤워헤드 오프라인 점검(파티클/막힘 육안 확인)
+
+## 5.2 Edge-Ring
+
+<aside>
+📌
+
+- 데이터 설계
+    - 실제 원인은 “식각 불균일 (PM 후 RF power 드리프트)” ****: ETCH-02/CH-B의 RF power 드리프트(PM 이후 시작)
+    - 함정으로 (a) CMP-01은 불량 lot 다수가 통과하지만 정상 lot도 대량 통과, (b) 불량 발생 이후 ETCH-01에 PM 기록
+- 총 툴 호출 ~20회(T2 병렬 12회 포함)
+</aside>
+
+1. T1 get_wafer_map(L4522, 7) → VLM: "Edge-Ring, 웨이퍼 테두리 근처에 링 형태의 결함 패턴"
+2. KG 질의 (MCP 밖) → 후보: 식각 불균일 / CMP 에지 과연마 / 세정
+3. T2 ×12 (불량 lot 12개(임의값) 이력) ∥ 병렬
+4. T3 run_commonality_analysis(12 lots) → ETCH-02/CH-B 11/12 (92%), CMP-01 10/12 (83%)
+    
+    → 가설 H1: ETCH-02/CH-B 식각 불균일
+    
+5. T4 get_normal_lot_ratio(ETCH-02/CH-B) → 통과 84 lot 중 불량 15 (배경 불량률의 6배) [B1 → 가설 유지 결론]
+6. T7 get_maintenance_history(ETCH-02) → D-31 PM (ETCH 링 부품 교체) [A2]
+7. T5 query_telemetry(ETCH-02, D-31..D-1,
+params=[RF_power]) → D-31 이후 계단형 드리프트, 정상 범위 이탈 [A3 → 가설 지지 결론]
+8. T9 get_lot_timeline(L4522) → PM(D-31) < 드리프트 < L4522 식각(D-18) [B2 → 시간 정합성 통과]
+    
+    → 가설 H2: CMP-01 에지 과연마
+    
+9. T4 get_normal_lot_ratio(CMP-01) → 통과 210 lot 중 불량 12 (배경 수준) [B1 → 기각 결정(함정(a)에 해당함)]
+    
+    → 함정(b) 점검
+    
+10. T9 (3번에서 확보한 이력과 대조) → ETCH-01 PM은 D-5, 불량 lot 처리는 D-20~D-9 [B2 → 이벤트가 불량 lot 처리보다 뒤에 있으므로 후보 제외 (함정(b)에 해당)]
+11. evidence table 조립
+    
+    H1 지지: commonality 92% / PM 직후 드리프트 / 시간 정합 반대: 없음 미확인: D-14 CH-B 압력 결측(coverage.missing)
+    H2 반대: 정상 lot 다수 통과 → 기각
+    
+12. Critic:
+    
+    D1 (T9 재확인, 통과) / D2 (T4 기록 존재+재호출 일치, 통과) / D3 (missing 미인용, KG 메커니즘 문장 존재, 통과)
+    
+    → 가설 채택: "ETCH-02 CH-B 에지 플라즈마 불균일 (PM 후 RF power 드리프트)" + 다음 확인 항목: D-14 압력 데이터 확보
+    
+
+## 5.3 Scratch
+
+<aside>
+📌
+
+- 데이터 설계
+    - 진짜 원인은 “CMP 패드 마모/컨디셔닝 이상 (수명 초과, 교체 직전 집중)” : CMP-02/PLATEN-1의 패드 과사용 마모
+        - `pad_usage_hours`가 권장 수명을 D-10에 초과하고 컨디셔닝 이력이 없어, 불량이 패드 교체(D-1) 직전(D-9~D-2)에 집중되고 교체 후 소멸(A1(step=CMP) → A6(패드 교체 이력/사용 시간) → A2)
+        - 함정/변별 요소
+            - (a) D-1 패드 교체 기록 : "정비 직후 불량"(A2)으로 오독하면 오답이며 선후를 lot 단위로 확인해야 함
+            - (b) 같은 CMP 장비의 경쟁 원인인 슬러리 대입자와의 변별: 슬러리 계열 파라미터는 전 구간 정상
+            - (c) Scratch 소모수: 확보 lot 6개로 하한(5 lot) 근접
+- 총 툴 호출 ~15회(T2 병렬 6회 포함)
+</aside>
+
+1. T1 get_wafer_map(L5017, 3) → VLM: "Scratch, 선형 흔적"
+2. KG 질의 (MCP 밖) → 후보: CMP 패드 마모/컨디셔닝 / CMP 슬러리 대입자 / 세정 브러시
+3. 동일 기간 동일 판독 lot 수집 → 6 lot (하한 5 이상 → 통계 판단 가능하나 소모수 명심, A6 특이점)
+4. T2 ×6 (불량 lot 6개 이력) ∥ 병렬
+5. T3 run_commonality_analysis(6 lots, step=CMP) → CMP-02/PLATEN-1 6/6 (100%, n=6)
+T3 run_commonality_analysis(6 lots, step=세정) → 분산(최대 3/6) [A6-1 → H3 세정 브러시 조기 약화]
+    
+    →가설 H1: CMP-02 패드 마모/컨디셔닝 이상
+    
+6. T4 get_normal_lot_ratio(CMP-02/PLATEN-1,
+D-14..D-1) → 통과 21 lot 중 불량 6 (배경 불량률의 9배) [B1 → 가설 유지 결정]
+7. T7 get_maintenance_history(CMP-02) → 패드 교체 D-1, 직전 교체 D-43 (권장 주기 30일 초과 사용)
+컨디셔닝 디스크 교체 이력 없음 [A6-2]
+8. T5 query_telemetry(CMP-02, D-43..D-1,
+params=[pad_usage_hours, motor_torque,
+slurry_flow, slurry_particle]) → pad_usage_hours D-10에 권장 수명 초과,
+motor_torque 상승 드리프트(마모 부하)
+slurry_flow·particle 전 구간 정상 [A6-3]
+9. 슬러리 가설(H2) 판정 → 슬러리 계열 파라미터 정상 + 불량 집중이 슬러리 교체
+주기와 무관하고 패드 수명과 정합
+    
+    → H2 "지지 증거 없음" 기록 [A3 분기 및 변별(b)에 해당]
+    
+10. T9 get_lot_timeline(L5017) → 수명 초과(D-10) < 불량 lot CMP 처리(D-9~D-2) < 패드 교체(D-1)
+원인 이벤트는 교체가 아니라 수명 초과 → 선후 정합 [B2 → 함정(a)에 해당]
+11. T4 get_normal_lot_ratio(CMP-02, D-1..D+7) → 교체 후 통과 12 lot 전부 정상 : 교체로 불량이 멈춘 것이므로 마모 가설 보강 (교체≠원인, 교체=종결) [B1 → 변형]
+12. evidence table 조립:
+H1 지지: commonality 100%(단 n=6) / 패드 수명 초과 D-10 + torque 드리프트 / 컨디셔닝 부재
+/ 불량이 교체 직전 집중 및 교체 후 소멸 / 시간 정합
+반대: 없음 미확인: 소모수(n=6, 통계력 제한)를 명시적으로 기록
+H2 지지 없음(슬러리 파라미터 정상) → 기각 H3 몰림 없음 → 약화
+13. Critic: D1 (T9 재확인 — 수명 초과가 처리보다 앞섬, 통과) / D2 (T4 기록 존재+재호출 일치, 통과)
+/ D3 (소모수 한계를 결론에 병기, KG 메커니즘 문장 존재, 통과)
+→ 채택: "CMP-02 PLATEN-1 패드 과사용 마모 (권장 수명 초과 + 컨디셔닝 미실시)"
+    - 다음 확인 항목: 교체된 패드 오프라인 표면 검사, 컨디셔닝 레시피/주기 설정 점검
+
+# 6. Agent 결합
+
+1. Hypothesis Agent
+    
+    <aside>
+    📌
+    
+    가설별 검증 계획에 MCP Tool을 매핑
+    
+    </aside>
+    
+    1. KG/문헌에서 결함 패턴(Center/Edge-Ring/Scratch)의 후보 원인 공정 확보
+    2. `get_lot_history` + `run_commonality_analysis`로 불량 lot의 공통 인스턴스 확인
+    3. 공통 장비에 대해 `query_telemetry` / `get_alarm_history` / `get_maintenance_history`로 시점 일치 확인
+    4. `get_normal_lot_ratio`로 반대 근거 확인 → 약한 가설 기각
+    5. 가설별 evidence table(지지/반대/미확인/다음 액션) 조립 (P8)
+2. Critic Agent

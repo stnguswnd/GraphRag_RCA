@@ -144,7 +144,9 @@ evidence 없는 원인이 통째로 사라지던 비대칭 제거). 형상 경�
 - `CLEAN`/`EDS`: 트러블슈팅 문헌 없음 (결정: 빈 공정으로 두고 문서 추가 예정).
 - ref56 Table 1의 5개 패턴(`Donut`, `Edge-Loc`, `Loc`, `Near-Full`, `Random`)은 고정 3종 밖이라 버려짐.
   VLM 클래스를 9종으로 늘리면 그대로 살아남는 구조.
-- 표에 있으나 fab에 없는 변수(`gas flow @ ETCH`, `film stress` 등)는 옳게 버려지지만 가설도 줄어듦.
+- 표에 있으나 fab에 없는 변수(`gas flow @ ETCH`, `film stress` 등)는 관계로는 옳게 버려지되,
+  **(07-13) 신호명은 이제 보존됨** — `Cause.unverifiable_signals` → 출력 `verification.unverifiable_signals`.
+  agent는 C2(부족한 데이터)로 기록 (정합성검토 X1 운영 방침).
 
 ### [P6] ProcessStep join에 의미 필터 없음
 - 의심 공정의 모든 고장 모드가 패턴의 후보가 됨 (Center에 막 균열이 1순위로 올라옴).

@@ -28,6 +28,7 @@
 - **`자동`** — agent가 끝까지: `telemetry`를 `path.evidence`로 조인(T5) → 정상범위 대비 `direction` 이탈 판정 → 채택/기각 (MCP 시나리오 A3).
 - **`반자동`** — agent는 조회까지만: `maintenance`(T7) 또는 `lot_history.recipe_id`(T2)를 뽑아 근거로 첨부하고, 채택/기각 판정은 사람이 (A2·A6 / A5).
 - **`근거없음`** — fab 연결 자체가 없음: 문헌 서술로만 제시되며 검증 체인에 배정되지 않는다. evidence table의 참고 정보로만 쓴다.
+  단, `verification.unverifiable_signals`가 있으면 "지식은 있는데 fab이 계측하지 않는" 경우이므로 C2(부족한 데이터)로 구분해 기록한다.
 
 | 키 | 값 (예시) | 왜 필요한가 |
 |---|---|---|
@@ -51,6 +52,7 @@
 | `path.evidence_label` | `Parameter` \| `Maintenance` \| `Recipe` \| `None` | 검증 시나리오 라우팅 (A3 / A2·A6 / A5) |
 | `verification.fab_table` | `telemetry` \| `maintenance` \| `lot_history` \| `null` | agent가 조회할 fab 테이블 지정 |
 | `verification.direction` | `high` \| `low` \| `null` | T5 결과의 이탈 방향 판정 기준 |
+| `verification.unverifiable_signals` | `["gas_flow"]` \| `null` | 문헌이 지목했지만 fab 어휘에 없어 붙이지 못한 신호. '지식 없음'이 아니라 '계측 없음' — **C2(부족한 데이터)로 기록**할 것 |
 | `score.occurrence_prior` | `high` \| `mid` \| `low` | 문헌상 빈도 서술 (commonly/rare) — 순위 제1성분 |
 | `score.evidence_docs` | `3` | 경로 전체를 뒷받침하는 **서로 다른 문서** 수 — 교차 검증 강도 |
 | `score.evidence_chunks` | `10` | 경로 전체를 뒷받침하는 근거 청크 수 |

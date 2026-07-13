@@ -541,6 +541,7 @@ def validate_kg(
     kg: RcaGraph,
     dropped: Optional[list[str]] = None,
     chunk_text: str = "",
+    unverifiable: Optional[dict[str, set[str]]] = None,
 ) -> RcaGraph:
     """
     [Graph Pruning]
@@ -678,6 +679,11 @@ def validate_kg(
             tgt, reason = resolve_parameter(tgt, cause_steps.get(src, set()))
             if tgt is None:
                 log.append(f"{raw}: {reason}")
+                # 문헌이 지목한 신호 자체는 지식이다 — fab이 계측하지 않을 뿐(C2 성격).
+                # 버리되 신호명은 Cause에 보존해 출력까지 흘려보낸다 (정합성검토 X1-c).
+                if unverifiable is not None:
+                    signal = normalize_id(rel.target.strip()) or rel.target.strip()
+                    unverifiable.setdefault(src, set()).add(signal)
                 continue
         else:
             # Maintenance / Recipe 는 문서에서 자유 추출. 같은 청크에 노드가 있어야 한다.
@@ -751,6 +757,26 @@ _CHUNK_IDS_SET = """
                 WHEN NOT $chunk_id IN rel.chunk_ids THEN rel.chunk_ids + [$chunk_id]
                 ELSE rel.chunk_ids END
 """
+
+
+def save_unverifiable_signals(graph: Neo4jGraph, signals: dict[str, set[str]]) -> None:
+    """
+    문헌이 지목했지만 fab 어휘로 붙지 못한 검증 신호를 Cause 노드에 보존한다.
+    (예: film_stress, resist_thickness) — VERIFIED_BY 엣지는 만들지 않는다.
+    join key 원칙은 지키되 "지식은 있는데 계측이 없다"는 사실을 잃지 않기 위함.
+    """
+    if not signals:
+        return
+    items = [{"cause": c, "signals": sorted(s)} for c, s in signals.items()]
+    graph.query(
+        """
+        UNWIND $items AS it
+        MATCH (c:Cause {id: it.cause})
+        SET c.unverifiable_signals = coalesce(c.unverifiable_signals, [])
+            + [s IN it.signals WHERE NOT s IN coalesce(c.unverifiable_signals, [])]
+        """,
+        params={"items": items},
+    )
 
 
 def save_kg_to_neo4j(graph: Neo4jGraph, kg: RcaGraph, chunk: dict) -> None:
@@ -1040,7 +1066,8 @@ def main() -> None:
         kg = extract_kg_from_chunk(structured_llm, chunk)
 
         dropped: list[str] = []
-        kg = validate_kg(kg, dropped, chunk_text=chunk["text"])
+        unverifiable: dict[str, set[str]] = {}
+        kg = validate_kg(kg, dropped, chunk_text=chunk["text"], unverifiable=unverifiable)
 
         print(
             "FailureMode:", len(kg.failure_modes),
@@ -1055,6 +1082,7 @@ def main() -> None:
         total_dropped += len(dropped)
 
         save_kg_to_neo4j(graph, kg, chunk)
+        save_unverifiable_signals(graph, unverifiable)
         append_result_to_jsonl(OUTPUT_PATH, chunk, kg)
 
         totals["failure_modes"] += len(kg.failure_modes)
@@ -1072,8 +1100,10 @@ def main() -> None:
         for chunk in anchor_chunks:
             kg = extract_kg_from_chunk(structured_llm, chunk)
             dropped = []
-            kg = validate_kg(kg, dropped, chunk_text=chunk["text"])
+            unverifiable = {}
+            kg = validate_kg(kg, dropped, chunk_text=chunk["text"], unverifiable=unverifiable)
             save_kg_to_neo4j(graph, kg, chunk)
+            save_unverifiable_signals(graph, unverifiable)
             anchors = [
                 f"{r.kind} {r.source}->{r.target}"
                 for r in kg.relationships
