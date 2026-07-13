@@ -146,7 +146,7 @@ A6. 소모품 수명 / 교체 이력 검증 (Scratch 특화)
     | --- | --- | --- | --- |
     | **Center** | **증착 챔버 중심부 불균일 — 샤워헤드 막힘 (55%)** | **A1(step=DEPO) → A3(유량/압력) → A4** | **증착 장비 텔레메트리 드리프트** |
     | Center | CMP 중심 과연마 (25%) | A1(step=CMP) → A3(연마 압력/패드) → A2 | CMP 파라미터 or 정비 직후 시점 |
-    | ~~Center~~ | ~~세정 노즐 중심 분사 이상 (20%)~~ | ~~A1(step=CLEAN) → A4 → A2~~ | ~~세정 장비 알람/BM 이력~~ |
+    | Center | 세정 노즐 중심 분사 이상 (20%) | A1(step=CLEAN) → A4 → A2 | 세정 장비 알람/BM 이력 |
     | **Edge-Ring** | **식각 불균일 — 에지 플라즈마 밀도 (60%)** | **A1(step=ETCH) → A3(RF power/압력) → A4** | **etcher chamber 텔레메트리** |
     | Edge-Ring | CMP 엣지 과연마 (25%) | A1(step=CMP) → A3 → A2 | CMP 정비(패드 교체) 선후 |
     | Edge-Ring | 세정 문제 (15%) | A1(step=CLEAN) → A4 → A2 | 세정 알람/정비 |
@@ -160,7 +160,7 @@ A6. 소모품 수명 / 교체 이력 검증 (Scratch 특화)
                 - Thin-film Deposition(박막 증착)
                 - Chemical Mechanical Polishing (CMP, 화학적 기계적 연마)
                 - Photolithography Alignment (웨이퍼의 회로 패턴을 새기는 단계)
-                - ~~Cleaning Processes (세정(Wet/Dry Cleaning) 단계)~~
+                - Cleaning Processes (세정(Wet/Dry Cleaning) 단계)
             - 메커니즘
                 - Thin-film Deposition(박막 증착) 관련
                     - 증착 과정에서의 변동성(variations)이나 균일하지 않은 도포(non-uniformities)가 발생하면, 웨이퍼 중심부의 표면 결함이나 박막 두께에 불일치가 생길 수 있음
@@ -169,8 +169,8 @@ A6. 소모품 수명 / 교체 이력 검증 (Scratch 특화)
                     - 특히 웨이퍼의 평탄도(planarity)를 일정하게 유지하는 것이 중요한 중심 영역에서 이러한 연마 불균형이 집중적인 결함으로 나타남
                 - Photolithography Alignment 관련
                     - 웨이퍼의 회로 패턴을 새기는 단계에서, 특히 웨이퍼 중심 부근에서 패턴 왜곡(pattern distortions)이나 오버레이(overlay) 오류가 생길 수 있음
-                - ~~세정 관련~~
-                    - ~~세정 과정 중 잔류물(Residues)이나 입자들이 제거되지 않고 남아있는 상태에서, 웨이퍼 표면을 스치고 지나가며 긁힘을 만듦~~
+                - 세정 관련
+                    - 세정 과정 중 잔류물(Residues)이나 입자들이 제거되지 않고 남아있는 상태에서, 웨이퍼 표면을 스치고 지나가며 긁힘을 만듦
         - Edge-Ring
             - 특징: 웨이퍼의 가장자리(perimeter)를 따라 링 형태의 불량 패턴이 나타남
             - 추론 원인 공정 단계

@@ -1,7 +1,7 @@
 # RCA GraphRAG 파이프라인 — 진행 상황 & 남은 문제
 
-> 마지막 업데이트: 2026-07-10
-> 웨이퍼맵 불량 원인분석(RCA) 지식그래프 파이프라인. **스키마 정본은 `schema_v2.md` (v2.2).**
+> 마지막 업데이트: 2026-07-13
+> 웨이퍼맵 불량 원인분석(RCA) 지식그래프 파이프라인. **스키마 정본은 `schema_v2.md` (v2.4).**
 > `schema.md`는 v1 기록용. 옛 Text2Cypher 질의 코드는 `6_ask_graphrag_backup.py`.
 
 ---
@@ -16,7 +16,7 @@ data/raw/ 문헌 → 표 행 단위 청킹 → Neo4j 적재 → LLM KG 추출(+�
 
 | | |
 |---|---|
-| 노드 | FailureMode 120 · Cause 272 · Maintenance 134 · Recipe 18 · SpatialSignature(추출) 4 (+시드: DefectPattern 3 · ProcessStep 6 · Parameter 20) |
+| 노드 | FailureMode 120 · Cause 272 · Maintenance 134 · Recipe 18 · SpatialSignature(추출) 4 (+시드: DefectPattern 3 · ProcessStep 6 · Parameter 21) |
 | 앵커 엣지 | ARISES_IN: Center→{CMP,DEPO,LITHO} · Edge-Ring→{CLEAN,DEPO,ETCH} · Scratch→{CLEAN,CMP} / FORMS_IN: blob@center→{CMP,DEPO} |
 | 가설 | **총 642건** — Center 297 · Edge-Ring 249 (CMP 경유 51 포함) · Scratch 96 |
 | 매핑표 대응 | MCP 매핑표(취소선 제외 8항목) 패턴→공정 **누락 0** — X2 완전 해소 |
@@ -48,7 +48,7 @@ FORMS_IN이 닿는 공정을 ARISES_IN도 덮어서 dedup이 step 경로를 대�
 - `seeds/` — 고정 vocabulary 3종
   - `defect_patterns.json` (3종, VLM 출력 클래스와 동일해야 함)
   - `process_steps.json` (6종, join key: `lot_history.step`)
-  - `parameters.json` (20종, join key: `telemetry.param`, `steps` 필드가 별칭 해석 스코프)
+  - `parameters.json` (21종 — 07-13 `pad_usage_hours` 추가, join key: `telemetry.param`, `steps` 필드가 별칭 해석 스코프)
 
 ### 파이프라인 코드 (루트)
 - `0_reset.py` — Neo4j DB 전체 초기화 (스키마 변경 후 필수)
@@ -118,6 +118,14 @@ FORMS_IN이 닿는 공정을 ARISES_IN도 덮어서 dedup이 step 경로를 대�
    Parameter→A3 / Recipe→A5 / Maintenance→consumable?A6:A2 / 근거없음→null).
    소급 노드는 6번의 키워드 휴리스틱(pad/brush/slurry/filter/conditioner) 임시 판정 —
    다음 재추출 시 노드 속성으로 대체. 실측 분포: A2 209 / A3 97 / A5 32 / A6 44 / null 260.
+13. **(07-13) X1E 해소 — fab 어휘 정렬 (Q1 결정 반영)**: `pad_usage_hours`는 fab에 실재(git pull 갭)
+   → 시드 21종·`fab.md` CMP 3종·5번 Literal 동기 추가, `cmp_pad_wear` 매핑 가설 `[자동]` 승격 실측
+   (자동 99건). `shower_flow`/`pressure`는 `chamber_pressure` 별칭 처리. **잔여**: `motor_torque`·
+   `slurry_particle` 제거 결정 — [근거없음]+C2 방침 적용, 정합성검토 §4 X1E 기록.
+14. **(07-13) N4/Q7 해소 — Center-세정 취소선 해제 결정**: 취소선 사유가 "형상 서술 RAG 문서
+   부재"였음이 확인됨. KG측 무이상(그래프 경로 0건이 정상) 판정 후 MCP 문서 취소선 4곳 해제 —
+   문서↔yaml 재정렬. 역할 합의: 해당 행은 **문헌 무근거 큐레이션 항목**(5.1 함정 후보)으로,
+   후보 공급은 `candidates[]` 뷰(Q3)가 담당. Edge-bead removal 취소선은 유지(스코프 밖 별건).
 
 ---
 

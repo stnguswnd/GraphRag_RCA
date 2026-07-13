@@ -90,7 +90,7 @@ ParameterId = Literal[
     "exposure_dose", "focus_offset", "stage_temp", "alignment_offset",
     "rf_power", "chamber_pressure", "he_flow", "temperature", "etch_rate",
     "gas_flow", "susceptor_temp", "deposition_rate",
-    "down_force", "slurry_flow",
+    "down_force", "slurry_flow", "pad_usage_hours",
     "flow_rate", "megasonic_power", "chemical_temp", "rinse_time",
     "chuck_temp", "contact_resistance",
 ]
