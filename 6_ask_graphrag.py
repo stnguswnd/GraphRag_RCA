@@ -12,11 +12,15 @@ Parameter까지 이어지지 않는 경로는 가설로 치지 않는다. fab SQ
 """
 
 import os
+import re
 import sys
 import json
+import difflib
 import collections
 from datetime import datetime
 from pathlib import Path
+
+import yaml
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -190,6 +194,161 @@ LEGEND = """검증 등급 — 'fab.db에 있느냐'가 아니라 '에이전트�
   [근거없음] 검증 신호가 없는 문헌 서술. fab 데이터로 확인할 수 없습니다."""
 
 
+# =========================
+# 1.2 매핑 테이블 오버레이 (mapping_table.yaml)
+# -------------------------
+# [근거없음] 가설의 Cause를 패턴별 큐레이션 표와 유사도 매칭해 검증 신호를 채운다.
+# 그래프는 건드리지 않는다 — 문헌 추출(그래프)과 큐레이션 지식(오버레이)의 provenance를
+# 섞지 않기 위해 출력 조립 시점에만 얹는다. 채워진 가설은 mapping 블록으로 출처가 드러난다.
+#
+# 승격 규칙: telemetry_signature.param이 fab 20종 안에 있을 때만 [자동]으로 올린다.
+# 어휘 밖 param(pad_usage_hours 등)은 힌트로만 싣고 등급을 유지한다 (정합성검토 X1).
+#
+# mapping_table.yaml은 MCP/fab 쪽 소유라 KG 사정(매칭 키워드)을 넣지 않는다.
+# 표의 cause id(cmp_pad_wear)와 추출된 Cause(pad_condition_degrades)는 어휘가 달라
+# 순수 유사도로는 못 잇는다 — 그 간극을 메우는 매칭 키워드는 아래 상수로 KG 모듈이 소유한다.
+# 표에 항목이 늘면 여기 키워드만 추가하면 된다 (키 = 표의 cause id).
+# =========================
+
+MAPPING_PATH = BASE_DIR / "mapping_table.yaml"
+
+# 표의 cause id -> 추출된 Cause를 잇는 매칭 표현들 (소문자, 공백 구분)
+MAPPING_MATCH_KEYWORDS: dict[str, list[str]] = {
+    # Edge-Ring
+    "etch_nonuniformity": [
+        "etch nonuniformity", "etching non uniformities", "nonuniform etch",
+        "etch non uniformity", "edge plasma", "plasma density",
+    ],
+    "cmp_edge_overpolish": [
+        "edge overpolish", "edge over polish", "overpolish at edge",
+        "excessive polishing at edge", "edge over polishing",
+    ],
+    "clean_residue": [
+        "clean residue", "cleaning residue", "chemical residue",
+        "residue accumulation", "residual particles", "insufficient rinsing",
+    ],
+    # Center
+    "deposition_center_thickness": [
+        "deposition thickness", "thickness gradients", "film thickness inconsistencies",
+        "thin film deposition non uniformities", "center thickness", "showerhead",
+        "deposition variations",
+    ],
+    "cmp_center_overpolish": [
+        "center overpolish", "center polished too fast", "inadequate or uneven cmp",
+        "uneven cmp", "center over polish",
+    ],
+    "clean_nozzle_clog": [
+        "nozzle clog", "clean nozzle", "spray nozzle", "central residue",
+        "particle accumulations near the chuck center",
+    ],
+    # Scratch
+    "cmp_pad_wear": [
+        "pad wear", "pad condition", "worn pad", "pad degrade", "conditioning", "pad usage",
+    ],
+    "cmp_slurry_particle": [
+        "slurry particle", "abrasive particles", "particle agglomeration",
+        "large particle", "slurry contamination", "over pressure",
+    ],
+    "clean_brush_contact": [
+        "brush contact", "brush", "particle shedding", "aging components",
+    ],
+}
+
+DRIFT_TO_DIRECTION = {
+    "step_up": "high", "linear_up": "high",
+    "step_down": "low", "linear_down": "low",
+}
+
+MAPPING_MATCH_THRESHOLD = 0.55
+
+
+def _norm_text(raw: str) -> str:
+    return re.sub(r"[\s\-_]+", " ", str(raw).strip().lower())
+
+
+def load_mapping_table() -> dict[str, list[dict]]:
+    if not MAPPING_PATH.exists():
+        return {}
+    data = yaml.safe_load(MAPPING_PATH.read_text(encoding="utf-8")) or {}
+    return {pattern: entries or [] for pattern, entries in data.items()}
+
+
+def _load_fab_param_ids() -> set[str]:
+    data = json.loads((SEEDS_DIR / "parameters.json").read_text(encoding="utf-8"))
+    return {n["id"] for n in data["nodes"]}
+
+
+MAPPING_TABLE = load_mapping_table()
+FAB_PARAM_IDS = _load_fab_param_ids()
+
+
+def _similarity(cause_text: str, surface: str) -> float:
+    """부분일치(1.0) > 토큰 자카드 > difflib 순으로 가장 후한 점수."""
+    if surface in cause_text or cause_text in surface:
+        return 1.0
+    a, b = set(cause_text.split()), set(surface.split())
+    jaccard = len(a & b) / len(a | b) if a | b else 0.0
+    ratio = difflib.SequenceMatcher(None, cause_text, surface).ratio()
+    return max(jaccard, ratio)
+
+
+def match_mapping(pattern: str, cause_id: str, cause_name: str) -> tuple[dict, float] | None:
+    """
+    이 패턴 섹션의 표 항목 중 Cause와 가장 유사한 것. 임계값 미달이면 None.
+    매칭 표면 = 표의 cause id + KG 모듈이 소유한 MAPPING_MATCH_KEYWORDS (yaml은 손대지 않는다).
+    """
+    cause_text = _norm_text(f"{cause_id} {cause_name}")
+    best, best_score = None, 0.0
+    for entry in MAPPING_TABLE.get(pattern, []):
+        table_cause = entry.get("cause", "")
+        surfaces = [table_cause, *MAPPING_MATCH_KEYWORDS.get(table_cause, [])]
+        score = max(_similarity(cause_text, _norm_text(s)) for s in surfaces if s)
+        if score > best_score:
+            best, best_score = entry, score
+    if best is not None and best_score >= MAPPING_MATCH_THRESHOLD:
+        return best, best_score
+    return None
+
+
+def apply_mapping_fill(pattern: str, rows: list[dict]) -> int:
+    """
+    [근거없음] 행에 매핑 표의 검증 신호를 채운다. 채운 행 수를 반환.
+    row["mapping"]에 근거(항목, 점수, prob, citation)를 남긴다.
+    """
+    filled = 0
+    for row in rows:
+        if row["tier"] != TIER_NONE:
+            continue
+        hit = match_mapping(pattern, row["cause"], row["cause_name"] or "")
+        if hit is None:
+            continue
+        entry, score = hit
+        sig = entry.get("telemetry_signature") or {}
+        param, drift = sig.get("param"), sig.get("drift")
+
+        row["mapping"] = {
+            "matched_cause": entry.get("cause"),
+            "score": round(score, 3),
+            "process": entry.get("process"),
+            "prob": entry.get("prob"),
+            "param": param,
+            "drift": drift,
+            "citation": entry.get("citation"),
+            "param_in_fab_vocab": param in FAB_PARAM_IDS,
+        }
+
+        # fab 어휘에 있는 param일 때만 [자동] 승격. 아니면 힌트로만 남긴다.
+        if param in FAB_PARAM_IDS:
+            row["tier"] = TIER_AUTO
+            row["evidence"] = param
+            row["evidence_name"] = param
+            row["evidence_label"] = "Parameter"
+            row["fab_table"] = "telemetry"
+            row["direction"] = DRIFT_TO_DIRECTION.get(drift)
+        filled += 1
+    return filled
+
+
 # 같은 (공정, 고장, 원인, 신호) 꼬리를 두 경로가 모두 찾으면 한 가설로 합치되,
 # 패턴을 직접 지목한 문헌(step)이 형상 서술(signature)보다 강한 근거다.
 ROUTE_RANK = {"step": 2, "signature": 1, "direct": 0}
@@ -217,7 +376,19 @@ def fetch_hypotheses(graph: Neo4jGraph, pattern: str) -> list[dict]:
         if key not in best or row["_score"] > best[key]["_score"]:
             best[key] = row
 
-    ranked = sorted(best.values(), key=lambda r: r["_score"], reverse=True)
+    survivors = list(best.values())
+
+    # 매핑 테이블 오버레이 — [근거없음]을 큐레이션 지식으로 채운다 (tier 승격 가능).
+    filled = apply_mapping_fill(pattern, survivors)
+    if filled:
+        print(f"  (mapping_table: [근거없음] {filled}건 채움)")
+
+    # tier가 승격됐을 수 있으므로 점수를 다시 계산해 정렬한다.
+    for row in survivors:
+        prior = PRIOR_RANK.get(row["occurrence_prior"], 1)
+        row["_score"] = (row["tier"], prior, row["confidence"], ROUTE_RANK[row["route"]])
+
+    ranked = sorted(survivors, key=lambda r: r["_score"], reverse=True)
     return ranked if TOP_K is None else ranked[:TOP_K]
 
 
@@ -430,10 +601,12 @@ def main() -> None:
                 )
             print(f"   근거: {trail}")
 
+            mapping = row.get("mapping")
             if row["tier"] == TIER_AUTO:
+                src = f" [mapping_table: {mapping['matched_cause']}, prob={mapping['prob']}]" if mapping else ""
                 print(
                     f"   검증: [자동] agent가 판정. {row['fab_table']}.param = '{row['evidence']}'"
-                    f" 를 정상범위와 비교 (예상 이탈 방향: {row['direction']})"
+                    f" 를 정상범위와 비교 (예상 이탈 방향: {row['direction']}){src}"
                 )
             elif row["tier"] == TIER_SEMI:
                 print(
@@ -442,6 +615,13 @@ def main() -> None:
                 )
             else:
                 print("   검증: [근거없음] fab 데이터에 연결되지 않음. 문헌 서술로만 존재합니다")
+                if mapping:
+                    hint = f"param={mapping['param']}" if mapping["param"] not in (None, "none") \
+                        else f"process={mapping['process']} (이력 단서)"
+                    warn = "" if mapping["param_in_fab_vocab"] or mapping["param"] in (None, "none") \
+                        else " ⚠ fab 어휘 밖 param — 승격 불가(X1)"
+                    print(f"          mapping_table 힌트: {mapping['matched_cause']}"
+                          f" (prob={mapping['prob']}, {hint}){warn}")
             print()
 
             entry["hypotheses"].append({
@@ -476,6 +656,9 @@ def main() -> None:
                     "chunk_ids": row.get("chunk_ids") or [],
                     "quotes": row.get("quotes") or [],
                 },
+                # mapping_table.yaml 오버레이로 채워진 경우만 non-null.
+                # 검증 신호의 출처가 문헌(그래프)이 아니라 큐레이션 표임을 명시한다.
+                "mapping": row.get("mapping"),
             })
 
     out_path = BASE_DIR / "outputs" / "hypotheses.json"

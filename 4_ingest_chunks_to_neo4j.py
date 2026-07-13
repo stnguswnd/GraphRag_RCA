@@ -135,50 +135,15 @@ def seed_parameters(graph: Neo4jGraph) -> None:
     )
 
 
-def seed_signatures(graph: Neo4jGraph) -> None:
-    """
-    SpatialSignature = (형상, 구역) 쌍. VLM이 형상 관측을 넘기는 진입점이자,
-    문헌의 형상 수준 서술(FORMS_IN)이 붙는 앵커다.
-    """
-    nodes = load_seed("signatures.json")
-    graph.query(
-        """
-        UNWIND $nodes AS n
-        MERGE (g:SpatialSignature {id: n.id})
-        SET g.name = n.name,
-            g.shape = n.shape,
-            g.zone = n.zone,
-            g.aliases = n.aliases
-        """,
-        params={"nodes": nodes},
-    )
-
-
-def seed_has_signature(graph: Neo4jGraph) -> None:
-    """
-    DefectPattern -> SpatialSignature 연결.
-    문헌 추출이 아니라 defect_patterns.json의 signatures 필드에서 결정적으로 시딩한다.
-    (패턴 클래스의 정의 자체가 형상+구역이므로 LLM이 개입할 이유가 없다.)
-    """
-    nodes = load_seed("defect_patterns.json")
-    graph.query(
-        """
-        UNWIND $nodes AS n
-        MATCH (p:DefectPattern {id: n.id})
-        UNWIND n.signatures AS sig_id
-        MATCH (g:SpatialSignature {id: sig_id})
-        MERGE (p)-[:HAS_SIGNATURE]->(g)
-        """,
-        params={"nodes": nodes},
-    )
-
-
 def seed_all_anchors(graph: Neo4jGraph) -> None:
+    """
+    결정적 시딩은 세 앵커뿐: DefectPattern / ProcessStep / Parameter.
+    SpatialSignature는 시딩하지 않는다 — 5번이 문서에서 추출해 만든다
+    (어휘는 코드의 Shape/Zone enum으로 닫혀 있어 id 파편화는 불가능).
+    """
     seed_defect_patterns(graph)
     seed_process_steps(graph)
     seed_parameters(graph)
-    seed_signatures(graph)
-    seed_has_signature(graph)   # signatures와 defect_patterns 이후에
 
 
 # =========================

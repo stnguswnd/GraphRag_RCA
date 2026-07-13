@@ -1,4 +1,4 @@
-# Wafer Defect RCA — Knowledge Graph Schema (v2.3)
+# Wafer Defect RCA — Knowledge Graph Schema (v2.4)
 
 반도체 웨이퍼 결함 근본원인 분석(RCA)용 지식 그래프 스키마 명세.
 GraphRAG(문서/도메인 지식) 기반의 **원인 가설 생성용** 그래프.
@@ -33,6 +33,17 @@ GraphRAG(문서/도메인 지식) 기반의 **원인 가설 생성용** 그래�
 - **앵커 보강 패스** 도입: 진입점 엣지(ARISES_IN/FORMS_IN/ATTRIBUTED_TO)의 추출 비결정성 완화를 위해
   패턴/형상을 언급하는 청크만 `ANCHOR_PASSES`(기본 3)회 재추출해 합집합 (MERGE라 중복 없음).
 
+**v2.3 → v2.4 (형상 레이어를 추출 방식으로 전환)**
+- **결정적 시딩은 세 앵커로 축소: `DefectPattern` / `ProcessStep` / `Parameter`.**
+  `SpatialSignature`는 더 이상 시딩하지 않는다 — `seeds/signatures.json` 삭제,
+  `HAS_SIGNATURE`도 문서의 형상 서술에서 **LLM이 추출**한다.
+- 단, **어휘는 코드 enum으로 닫는다**: `shape ∈ {ring, cluster, line, blob, global, random}`,
+  `zone ∈ {center, mid, edge, any}`. 노드 id는 코드가 `{shape}@{zone}`으로 조합한다.
+  → 표현이 달라도 id가 파편화될 수 없고(허브 join 보전), VLM의 **자유 서술** 형상 관측도
+  같은 enum으로 분류해 진입하면 된다 (문서 추출과 VLM 입력이 동일한 분류 계약을 공유).
+- 가드: 시그니처는 형상 표현이 원문에 있어야 인정(환각 차단),
+  `HAS_SIGNATURE`/`FORMS_IN`은 같은 청크에서 추출된 시그니처만 가리킬 수 있다(국소성).
+
 ---
 
 ## 문서 소스와 결합 구조
@@ -58,8 +69,8 @@ C는 공정을 우회한다. 문헌이 패턴의 원인을 말하되 **어느 �
 
 | Label | id (예시) | Properties | 추출 방식 | 설명 |
 |---|---|---|---|---|
-| `DefectPattern` | `Edge-Ring` | `name`, `aliases`, `signatures`, `spatial_keywords`, `expected_zone`, `expected_shape` | **고정 목록** | 웨이퍼맵 패턴 (질의 진입점) |
-| `SpatialSignature` | `ring@edge` | `name`, `shape`, `zone`, `aliases` | **고정 목록** | (형상,구역) 쌍. 형상 관측의 진입점 |
+| `DefectPattern` | `Edge-Ring` | `name`, `aliases`, `spatial_keywords`, `expected_zone`, `expected_shape` | **고정 목록** | 웨이퍼맵 패턴 (질의 진입점) |
+| `SpatialSignature` | `ring@edge` | `name`, `shape`, `zone` | **문서 추출** (id는 enum 조합) | (형상,구역) 쌍. 형상 관측의 진입점 |
 | `ProcessStep` | `ETCH` | `name`, `aliases` | **고정 목록** | 공정군 (문서 A·B의 join 노드) |
 | `FailureMode` | `incorrect_etch_rate` | `name`, `description`, `aliases` | 문서 추출 | 공정 고장 모드 |
 | `Cause` | `rf_power_drift` | `name`, `description`, `aliases` | 문서 추출 | 근본 원인 |
@@ -86,10 +97,13 @@ C는 공정을 우회한다. 문헌이 패턴의 원인을 말하되 **어느 �
 ### 고정 vocabulary
 
 - **DefectPattern:** `Center`, `Scratch`, `Edge-Ring`
-- **SpatialSignature:** `cluster@center`, `ring@edge`, `line@any` (`seeds/signatures.json`)
-  — ⚠ VLM이 출력하는 형상/구역 라벨과 정렬 필요. VLM 라벨 집합 확정 시 재검토.
 - **ProcessStep:** `LITHO`, `ETCH`, `DEPO`, `CMP`, `CLEAN`, `EDS`
 - **Parameter:** `fab.md`의 장비군별 파라미터 20종 (`seeds/parameters.json`)
+
+시딩은 위 세 앵커뿐이다. `SpatialSignature`는 문서에서 추출되며, 어휘만 코드 enum으로 닫힌다:
+`shape ∈ {ring, cluster, line, blob, global, random}` × `zone ∈ {center, mid, edge, any}`.
+VLM은 형상을 **자유 서술 텍스트**로 출력하므로, VLM 입력 모듈(미구현)이 그 텍스트를
+같은 shape/zone enum으로 분류해 `{shape}@{zone}` id로 그래프에 진입한다.
 
 세 라벨은 적재 전 사전 시딩되며(`4_ingest_chunks_to_neo4j.py`), ingest는 새로 생성하지 않고 연결만 한다.
 
@@ -132,7 +146,7 @@ id는 코드의 `Literal`에도 하드코딩돼 있다(LLM에 넘길 JSON schema
 | B | `CAUSED_BY` | `FailureMode` | → | `Cause` | 무엇이 원인인가 |
 | B | `VERIFIED_BY` | `Cause` | → | `Parameter` \| `Maintenance` \| `Recipe` | 어떤 fab 신호로 검증하는가 |
 | C | `ATTRIBUTED_TO` | `DefectPattern` | → | `Cause` | 문헌이 공정을 거치지 않고 지목한 원인 |
-| 시드 | `HAS_SIGNATURE` | `DefectPattern` | → | `SpatialSignature` | 패턴의 정의적 형상 (**결정적 시딩**, LLM 불개입) |
+| D | `HAS_SIGNATURE` | `DefectPattern` | → | `SpatialSignature` | 이 패턴은 이런 형상으로 나타난다 (문서 추출) |
 | D | `FORMS_IN` | `SpatialSignature` | → | `ProcessStep` | 이 형상은 주로 어느 공정에서 생기는가 |
 
 ### 관계 속성
@@ -228,7 +242,7 @@ id는 코드의 `Literal`에도 하드코딩돼 있다(LLM에 넘길 JSON schema
 DefectPattern ──ARISES_IN──────────────┐                          Cause
  (Edge-Ring)                            ▼                           ▲
      │                             ProcessStep ◄──OCCURS_IN── FailureMode
-     │ HAS_SIGNATURE (시드)            (ETCH)      (join)       (incorrect_etch_rate)
+     │ HAS_SIGNATURE (문서 D 추출)      (ETCH)      (join)       (incorrect_etch_rate)
      ▼                                  ▲                           │ CAUSED_BY
 SpatialSignature ──FORMS_IN─────────────┘                           ▼
  (ring@edge)      (문서 D: 형상 수준)                              Cause

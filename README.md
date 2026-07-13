@@ -25,7 +25,7 @@ data/raw/ 문헌 (표·산문)
                 │                                           ▼
 DefectPattern ──ARISES_IN──> ProcessStep <──OCCURS_IN── FailureMode
  (Edge-Ring)                   (ETCH)        (join)   (incorrect_etch_rate)
-     │ HAS_SIGNATURE (시드)      ▲                          │ CAUSED_BY
+     │ HAS_SIGNATURE (문서 추출)  ▲                          │ CAUSED_BY
      ▼                          │                          ▼
 SpatialSignature ──FORMS_IN─────┘                        Cause
  (ring@edge)   (문헌이 형상으로 말할 때)                     │ VERIFIED_BY
@@ -141,14 +141,15 @@ data/
     Wafer defect semantic reasoning....txt
                                        문서 D: Liao et al. 2026, 패턴/형상 -> 공정 (ARISES_IN, FORMS_IN)
     _reference/                        교과서 본문 339KB — 로더가 읽지 않음
-  seeds/    고정 vocabulary (문헌에서 뽑지 않고 미리 적재하는 앵커)
-    defect_patterns.json   3종   VLM 출력 클래스와 일치해야 함 (signatures 필드 -> HAS_SIGNATURE 시딩)
-    signatures.json        3종   (형상@구역) 쌍. VLM 형상 라벨과 정렬 필요
+  seeds/    고정 vocabulary (문헌에서 뽑지 않고 미리 적재하는 앵커 — 이 3종이 전부)
+    defect_patterns.json   3종   VLM 출력 클래스와 일치해야 함
     process_steps.json     6종   join key: lot_history.step
     parameters.json       20종   join key: telemetry.param  (steps 필드 = 별칭 해석 스코프)
 ```
 
-`FailureMode` / `Cause` / `Maintenance` / `Recipe`만 LLM이 문헌에서 자유롭게 만든다.
+`FailureMode` / `Cause` / `Maintenance` / `Recipe` / `SpatialSignature`는 LLM이 문헌에서 만든다.
+단 `SpatialSignature`는 어휘가 코드 enum(`shape` 6종 × `zone` 4종)으로 닫혀 있고
+id를 코드가 `{shape}@{zone}`으로 조합하므로, 표현이 달라도 노드가 파편화되지 않는다.
 앵커 3종(`DefectPattern`/`ProcessStep`/`Parameter`)은 시드에 있는 노드에 **연결만** 한다 —
 LLM이 뱉은 표기(`circular ring`, `etching step`, `RF Power`)는 시드 `aliases` 역인덱스로
 canonical id에 치환된 뒤 `MATCH`로만 붙으므로, 시드 밖 노드는 생길 수 없다.

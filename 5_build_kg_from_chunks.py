@@ -68,8 +68,22 @@ ProcessStepId = Literal["LITHO", "ETCH", "DEPO", "CMP", "CLEAN", "EDS"]
 # seeds/defect_patterns.json 과 반드시 동일. id == VLM 출력 클래스
 DefectPatternId = Literal["Center", "Scratch", "Edge-Ring"]
 
-# seeds/signatures.json 과 반드시 동일. (형상@구역) 쌍. VLM 형상 라벨과 정렬 예정
-SpatialSignatureId = Literal["cluster@center", "ring@edge", "line@any"]
+# 형상/구역 어휘 — 시드가 아니라 코드 enum으로만 닫는다.
+# SpatialSignature 노드는 시딩하지 않고 문서에서 LLM이 추출한다.
+# id는 코드가 "{shape}@{zone}"으로 조합하므로 표현이 달라도 id 파편화가 불가능하다.
+# VLM의 자유 서술 형상 관측도 (미래의 입력 모듈에서) 같은 enum으로 분류해 진입한다.
+ShapeId = Literal["ring", "cluster", "line", "blob", "global", "random"]
+ZoneId = Literal["center", "mid", "edge", "any"]
+
+# grounding용: 이 형상을 말한다고 볼 수 있는 원문 표현들
+SHAPE_SURFACES = {
+    "ring": ["ring", "annular", "donut", "circular"],
+    "cluster": ["cluster", "clustered", "concentrated", "blob", "localized"],
+    "line": ["line", "linear", "scratch", "streak", "elongated", "directional"],
+    "blob": ["blob", "spot", "concentrated"],
+    "global": ["entire", "whole", "global", "full", "wafer-wide"],
+    "random": ["random", "sporadic", "scattered"],
+}
 
 # seeds/parameters.json 과 반드시 동일. id == fab telemetry.param
 ParameterId = Literal[
@@ -83,6 +97,7 @@ ParameterId = Literal[
 
 RelationshipKind = Literal[
     "ARISES_IN",       # DefectPattern    -> ProcessStep
+    "HAS_SIGNATURE",   # DefectPattern    -> SpatialSignature (문서의 형상 서술에서 추출)
     "FORMS_IN",        # SpatialSignature -> ProcessStep  (형상 수준 서술)
     "ATTRIBUTED_TO",   # DefectPattern    -> Cause   (공정을 거치지 않는 직결 서술)
     "OCCURS_IN",       # FailureMode      -> ProcessStep
@@ -102,7 +117,8 @@ FAB_TABLE = {
 
 PROCESS_STEP_IDS: set[str] = set(get_args(ProcessStepId))
 DEFECT_PATTERN_IDS: set[str] = set(get_args(DefectPatternId))
-SIGNATURE_IDS: set[str] = set(get_args(SpatialSignatureId))
+SHAPE_IDS: set[str] = set(get_args(ShapeId))
+ZONE_IDS: set[str] = set(get_args(ZoneId))
 PARAMETER_IDS: set[str] = set(get_args(ParameterId))
 
 
@@ -115,7 +131,6 @@ def assert_enums_match_seeds() -> None:
     pairs = [
         ("defect_patterns.json", DEFECT_PATTERN_IDS),
         ("process_steps.json", PROCESS_STEP_IDS),
-        ("signatures.json", SIGNATURE_IDS),
         ("parameters.json", PARAMETER_IDS),
     ]
     for file_name, enum_ids in pairs:
@@ -157,7 +172,6 @@ def _build_alias_index(file_name: str) -> dict[str, str]:
 
 DEFECT_PATTERN_INDEX = _build_alias_index("defect_patterns.json")
 PROCESS_STEP_INDEX = _build_alias_index("process_steps.json")
-SIGNATURE_INDEX = _build_alias_index("signatures.json")
 
 
 def resolve_anchor(raw: str, index: dict[str, str]) -> Optional[str]:
@@ -247,7 +261,8 @@ _ANCHOR_RE = re.compile(
     r"\b(" + "|".join(
         re.escape(s) for s in
         sorted(set(_build_alias_index("defect_patterns.json"))
-               | set(_build_alias_index("signatures.json")), key=len, reverse=True)
+               | {w for words in SHAPE_SURFACES.values() for w in words},
+               key=len, reverse=True)
     ) + r")\b"
 )
 
@@ -310,6 +325,20 @@ class RecipeNode(BaseModel):
     description: str = Field(description="완결된 한국어 한 문장")
 
 
+class SignatureNode(BaseModel):
+    """
+    웨이퍼맵 공간 시그니처 = (형상, 구역) 쌍. 문서의 형상 서술에서 추출한다.
+    id는 코드가 "{shape}@{zone}"으로 조합하므로 LLM은 두 enum만 고르면 된다.
+    """
+    shape: ShapeId = Field(description="형상. 예: ring-shaped -> ring, linear streaks -> line")
+    zone: ZoneId = Field(description="구역. 예: outer edge -> edge, geometric center -> center, 전체/불특정 -> any")
+    description: str = Field(default="", description="문헌의 형상 서술 원문 요약(짧게)")
+
+    @property
+    def id(self) -> str:
+        return f"{self.shape}@{self.zone}"
+
+
 class Relationship(BaseModel):
     """
     kind 별 (source, target) 규약:
@@ -344,6 +373,7 @@ class RcaGraph(BaseModel):
     causes: list[CauseNode]
     maintenance: list[MaintenanceNode]
     recipes: list[RecipeNode]
+    signatures: list[SignatureNode]
     relationships: list[Relationship]
 
 
@@ -411,12 +441,15 @@ def build_prompt(chunk: dict) -> str:
   (웨이퍼맵 상의 공간 패턴만 해당. "circular ring"→Edge-Ring, "bulls eye"→Center,
    "linear defect"/"scuff mark"→Scratch)
 
-공간 시그니처(SpatialSignature) 3종 — "{{형상}}@{{구역}}" 쌍:
-  cluster@center, ring@edge, line@any
-  (문헌이 패턴 클래스명 없이 형상으로 말할 때 사용.
-   "ring-shaped pattern at the outer edge"→ring@edge,
-   "concentrated cluster near the center"→cluster@center,
-   "linear streaks"/"directional scratches"→line@any)
+공간 시그니처(SpatialSignature) — 문헌의 형상 서술에서 추출하는 노드:
+  signatures 리스트에 shape와 zone을 enum으로 골라 넣으세요.
+    shape 6종: ring, cluster, line, blob, global, random
+    zone 4종: center, mid, edge, any (불특정이면 any)
+  관계에서 이 노드를 가리킬 때는 "{{shape}}@{{zone}}" 형식의 id를 쓰세요.
+    "ring-shaped pattern at the outer edge" -> shape=ring, zone=edge -> id "ring@edge"
+    "concentrated cluster near the geometric center" -> cluster@center
+    "linear streaks across the wafer" / "directional scratches" -> line@any
+  문헌이 형상을 서술할 때만 만드세요. 형상 언급이 없는 청크에서는 만들지 마세요.
 
 공정 변수(Parameter) 20종:
   exposure_dose, focus_offset, stage_temp, alignment_offset,
@@ -436,8 +469,12 @@ Maintenance와 Recipe는 문헌 표현으로 자유롭게 만드세요.
 - Maintenance : 정비 행위. 조치 문장에서 뽑는다. (예: chamber wet clean, replace defective thermocouple)
 - Recipe      : 레시피 확인 대상. (예: process recipe)
 
-관계(kind) 6종:
+관계(kind) 7종:
 - ARISES_IN:     (DefectPattern) -> (ProcessStep)  "이 불량 패턴은 이 공정을 의심케 한다" (occurrence_prior 채우기)
+- HAS_SIGNATURE: (DefectPattern) -> (SpatialSignature)  "이 패턴은 이런 형상으로 나타난다"
+                 문헌이 패턴의 생김새를 서술할 때 씁니다. target은 "{{shape}}@{{zone}}" id.
+                 예: "The Edge-Ring defect appears as a ring-shaped pattern near the outer edge"
+                     -> signatures에 (ring, edge) 추가 + HAS_SIGNATURE: Edge-Ring -> ring@edge
 - FORMS_IN:      (SpatialSignature) -> (ProcessStep)  "이 형상은 주로 이 공정에서 생긴다" (occurrence_prior 채우기)
                  문헌이 패턴 클래스명 없이 **형상 서술**로 공정을 지목할 때 씁니다.
                  예: "This ring-shaped failure pattern at the outer edge reflects issues in cleaning steps"
@@ -529,6 +566,16 @@ def validate_kg(
         "Maintenance": {m.id for m in kg.maintenance},
         "Recipe": {r.id for r in kg.recipes},
     }
+    # 시그니처 id는 enum 조합이라 정규화 불필요. 단, 형상이 원문에 실제로 서술됐는지 검사한다.
+    sig_ids: set[str] = set()
+    for sig in kg.signatures:
+        surfaces = SHAPE_SURFACES.get(sig.shape, [])
+        if chunk_text and not any(
+            re.search(rf"\b{re.escape(w)}\b", _normalize_key(chunk_text)) for w in surfaces
+        ):
+            log.append(f"Signature {sig.id!r}: 청크 원문에 형상 서술 없음 (환각)")
+            continue
+        sig_ids.add(sig.id)
 
     valid: list[Relationship] = []
     deferred: list[Relationship] = []
@@ -552,11 +599,20 @@ def validate_kg(
             if chunk_text and not step_is_grounded_in(tgt, chunk_text):
                 log.append(f"{raw}: 청크 원문에 공정 '{tgt}' 언급 없음 (환각)")
                 continue
+        elif rel.kind == "HAS_SIGNATURE":
+            src = resolve_anchor(src, DEFECT_PATTERN_INDEX)
+            tgt = tgt.lower()
+            if src is None:
+                log.append(f"{raw}: DefectPattern 매핑 실패 (고정 3종에 없음)")
+                continue
+            if tgt not in sig_ids:
+                log.append(f"{raw}: Signature가 이 청크에서 추출되지 않음")
+                continue
         elif rel.kind == "FORMS_IN":
-            src = resolve_anchor(src, SIGNATURE_INDEX)
+            src = src.lower()
             tgt = resolve_anchor(tgt, PROCESS_STEP_INDEX)
-            if src is None or tgt is None:
-                log.append(f"{raw}: 앵커 매핑 실패 (SpatialSignature/ProcessStep)")
+            if src not in sig_ids or tgt is None:
+                log.append(f"{raw}: Signature 미추출 또는 ProcessStep 매핑 실패")
                 continue
             if chunk_text and not step_is_grounded_in(tgt, chunk_text):
                 log.append(f"{raw}: 청크 원문에 공정 '{tgt}' 언급 없음 (환각)")
@@ -657,11 +713,20 @@ def validate_kg(
     maintenance = [m for m in kg.maintenance if ("Maintenance", m.id) in used]
     recipes = [r for r in kg.recipes if ("Recipe", r.id) in used]
 
+    # 어떤 관계에도 걸리지 않은 Signature도 고아라 버린다.
+    linked_sigs = {r.target for r in valid if r.kind == "HAS_SIGNATURE"} \
+                | {r.source for r in valid if r.kind == "FORMS_IN"}
+    signatures = [s for s in kg.signatures if s.id in linked_sigs and s.id in sig_ids]
+    # 같은 (shape,zone)이 중복 추출됐으면 하나만
+    seen: set[str] = set()
+    signatures = [s for s in signatures if not (s.id in seen or seen.add(s.id))]
+
     return RcaGraph(
         failure_modes=kg.failure_modes,
         causes=causes,
         maintenance=maintenance,
         recipes=recipes,
+        signatures=signatures,
         relationships=valid,
     )
 
@@ -693,9 +758,26 @@ def save_kg_to_neo4j(graph: Neo4jGraph, kg: RcaGraph, chunk: dict) -> None:
     causes = [n.model_dump() for n in kg.causes]
     maintenance = [n.model_dump() for n in kg.maintenance]
     recipes = [n.model_dump() for n in kg.recipes]
+    signatures = [{**s.model_dump(), "id": s.id} for s in kg.signatures]
     rels = [r.model_dump() for r in kg.relationships]
 
     chunk_id = chunk["chunk_id"]
+
+    # (0) SpatialSignature 노드 — 시딩하지 않으므로 여기서 생성된다.
+    #     id가 enum 조합이라 문서가 달라도 같은 (shape,zone)은 같은 노드로 MERGE된다.
+    if signatures:
+        graph.query(
+            """
+            MATCH (c:Chunk {id: $chunk_id})
+            UNWIND $nodes AS n
+            MERGE (g:SpatialSignature {id: n.id})
+            SET g.shape = n.shape,
+                g.zone = n.zone,
+                g.name = n.id
+            MERGE (c)-[:MENTIONS]->(g)
+            """,
+            params={"chunk_id": chunk_id, "nodes": signatures},
+        )
 
     # (1) FailureMode 노드 + 이 청크가 언급했음을 기록
     if failure_modes:
@@ -780,6 +862,22 @@ def save_kg_to_neo4j(graph: Neo4jGraph, kg: RcaGraph, chunk: dict) -> None:
         MERGE (p)-[rel:ARISES_IN]->(s)
         SET rel.occurrence_prior = r.occurrence_prior,
             rel.extraction_confidence = r.extraction_confidence,
+            rel.description = r.description,
+            rel.quotes = r.quotes,
+        {_CHUNK_IDS_SET}
+        """,
+        params={"rels": rels, "chunk_id": chunk_id},
+    )
+
+    # (4a-1) HAS_SIGNATURE : DefectPattern -> SpatialSignature  (문서의 형상 서술에서 추출)
+    graph.query(
+        f"""
+        UNWIND $rels AS r
+        WITH r WHERE r.kind = 'HAS_SIGNATURE'
+        MATCH (p:DefectPattern {{id: r.source}})
+        MATCH (g:SpatialSignature {{id: r.target}})
+        MERGE (p)-[rel:HAS_SIGNATURE]->(g)
+        SET rel.extraction_confidence = r.extraction_confidence,
             rel.description = r.description,
             rel.quotes = r.quotes,
         {_CHUNK_IDS_SET}
@@ -930,7 +1028,7 @@ def main() -> None:
 
     totals = {
         "failure_modes": 0, "causes": 0,
-        "maintenance": 0, "recipes": 0, "relationships": 0,
+        "maintenance": 0, "recipes": 0, "signatures": 0, "relationships": 0,
     }
     total_dropped = 0
 
@@ -949,6 +1047,7 @@ def main() -> None:
             "| Cause:", len(kg.causes),
             "| Maintenance:", len(kg.maintenance),
             "| Recipe:", len(kg.recipes),
+            "| Signature:", len(kg.signatures),
             "| 관계:", len(kg.relationships),
         )
         for reason in dropped:
@@ -962,6 +1061,7 @@ def main() -> None:
         totals["causes"] += len(kg.causes)
         totals["maintenance"] += len(kg.maintenance)
         totals["recipes"] += len(kg.recipes)
+        totals["signatures"] += len(kg.signatures)
         totals["relationships"] += len(kg.relationships)
 
     # 앵커 보강: 패턴/형상을 언급하는 청크만 K-1회 재추출해 합집합 (MERGE라 중복 없음)
