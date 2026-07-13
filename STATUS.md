@@ -111,28 +111,22 @@ evidence 없는 원인이 통째로 사라지던 비대칭 제거). 형상 경�
 - **해결안**: 프롬프트에 우선순위 명시 — "원인이 계측 변수의 이상이면 반드시 Parameter 우선,
   Maintenance는 원인이 정비 그 자체일 때만".
 
-### [P2] 가설 점수 체계가 타당성이 없음 — 재설계 필요
-현재 점수 = `(검증등급, occurrence_prior, confidence평균)` 튜플 내림차순. **믿을 만한 성분이
-검증등급 하나뿐**이고, 그마저 "확인하기 쉬운 순서"이지 "그럴듯한 순서"가 아니다.
+### [P2] 가설 점수 체계 — 1차 재설계 완료 (07-13), 잔여 과제 아래
+**(07-13 반영)** 순위에서 **tier와 confidence를 제거**하고 측정값만 남김:
+`(occurrence_prior, evidence_docs, evidence_chunks)` 내림차순 + cause 이름순 결정적 tiebreak.
+- 근거 빈도는 **경로 전체**(진입 엣지 + CAUSED_BY + VERIFIED_BY)의 chunk_ids 합집합에서 계산.
+  실측 분포 (1,1)~(4,8)로 실질 변별 — Center 1위가 3문서·10청크 근거의 `incorrect_process_recipe`.
+- 철학: 검증 등급(tier)은 "어떻게 확인하느냐"의 분류이지 그럴듯함이 아니다. tier는 필드로만 유지.
+- 출력도 함께 축소: `route`(path의 null 패턴으로 유도), `detail` 블록, `path.pattern`,
+  `questions[].question`, `counts.by_route`, `score.confidence` 삭제. `KG_output_명세.md` 갱신됨.
 
-무엇이 잘못됐나:
-- **뒤 두 성분은 LLM 자기평가다.** 계산도 통계도 아니고, 근거 수·교차검증이 반영되지 않는다.
-  실측상 거의 전부 `5.0`/`high` 동점이라 같은 등급 안 순서는 Neo4j 반환 순서에 가깝다.
-- **평균이 약한 고리를 감춘다.** `(5,5,2)` 경로와 `(4,4,4)` 경로가 똑같이 4.0.
-  인과 사슬은 가장 약한 고리만큼만 믿을 수 있으므로 최솟값이 맞다.
-- **경로 4개 관계 중 3개만 집계.** `OCCURS_IN`의 confidence가 점수에 안 들어간다.
-- **근거의 양이 무시된다.** 문서 세 곳이 말하는 원인과 한 문장이 스친 원인이 같은 점수.
-  `chunk_ids`로 기록은 하면서 쓰지 않는다.
-- **저장 버그가 점수를 오염시킨다.** 같은 관계가 여러 청크에서 나오면 `SET`이 confidence를
-  마지막 값으로 덮어쓴다 (chunk_ids는 누적되는데 confidence는 아님) → 처리 순서에 따라 점수가 달라짐.
-- **`coalesce(..., 3)`이 결측을 "보통 신뢰도"로 둔갑시킨다.**
-
-재설계 방향 (→ Next Action Steps ③):
-1. confidence: 평균 → **경로 최솟값**, `OCCURS_IN` 포함, 저장 시 `max()` 유지, coalesce 제거
-2. **근거 강도**를 독립 성분으로: 근거 청크 수 + 출처 문서 다양성 (같은 문서 반복 < 서로 다른 문서)
-3. 결정적 tiebreak (이름순) — 실행마다 순서가 바뀌지 않게
-4. 장기적으로는 **fab 검증 결과가 사후 점수(posterior)** — 채택/기각 이력이 쌓이면
-   그것이 진짜 순위이고, 문헌 기반 점수는 prior 역할로 물러난다 (②의 Hypothesis 노드와 연결)
+**잔여 과제 (아직 유효한 것):**
+- **제1성분 `occurrence_prior`도 LLM 산출이다** (문헌의 commonly/rare 서술 해석).
+  실측상 대부분 `high`라 변별은 사실상 evidence_docs/chunks가 담당. 장기적으로 개선 대상.
+- **저장 버그**: 같은 관계가 여러 청크에서 나오면 `SET`이 `extraction_confidence`를 마지막 값으로
+  덮어씀 (chunk_ids는 누적되는데 confidence는 아님). 순위에서는 빠졌지만 그래프 데이터 품질 문제로 잔존.
+- 장기적으로는 **fab 검증 결과가 사후 점수(posterior)** — 채택/기각 이력이 쌓이면 그것이 진짜
+  순위이고, 문헌 기반 점수는 prior 역할로 물러난다 (②의 Hypothesis 노드와 연결).
 
 ### [P3] Maintenance 노드 과다 + 미중복제거 (106개)
 - `chamber_wet_clean`처럼 유의미한 것과 `inspect_whether_residual_copper_cleaning_finished...`
@@ -180,12 +174,11 @@ evidence 없는 원인이 통째로 사라지던 비대칭 제거). 형상 경�
 - `Hypothesis` 투영 노드(경로를 평탄화한 노드로 굳혀 검증 결과를 기록할 자리)를 만들지 여부도
   이때 함께 결정하는 게 자연스러움.
 
-### ③ 가설 점수 체계 재설계 (P2) ← **다음 작업**
-현행 점수는 검증등급 외에는 순위 근거가 없다 (상세는 P2).
-- 단기: min-confidence(OCCURS_IN 포함) + 근거 청크 수·문서 다양성 + 결정적 tiebreak
-  + 저장 시 confidence `max()` 유지. 전부 `6_ask_graphrag.py`/`5번` 소폭 수정으로 가능.
-- 장기: fab 검증 채택/기각 이력을 사후 점수로 (②의 `Hypothesis` 노드에 기록 → 문헌 점수는 prior).
-- ①의 jsonl에 점수 성분을 분해해서 담아야 agent와 사람이 순위 근거를 검산할 수 있다.
+### ③ 가설 점수 체계 재설계 (P2) ← **1차 완료 (07-13)**
+- **완료**: 순위에서 tier·confidence 제거, `(occurrence_prior, evidence_docs, evidence_chunks)`
+  측정값 순위 + 결정적 tiebreak. 출력 구조 축소 (`KG_output_명세.md` 참조).
+- **남음**: 저장 시 confidence `max()` 유지(그래프 품질), occurrence_prior의 LLM 의존 개선,
+  장기적으로 fab 검증 이력 기반 posterior (②의 `Hypothesis` 노드에 기록 → 문헌 점수는 prior).
 
 ### ④ 그 외 후보 (우선순위 낮음, P1·P3~P6 대응)
 1. Maintenance 편향 프롬프트 수정 (P1) — `[자동]` 가설을 늘리는 가장 싼 수
