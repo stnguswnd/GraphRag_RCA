@@ -5,6 +5,7 @@
 ## 대표 키 역할
 
 - **`tier`** — 이 가설을 *어떻게 확인하느냐*의 분류 (자동/반자동/근거없음). 검증 시나리오 분기용이며 순위와 무관.
+- **`scenario_hint`** — MCP 검증 체인 라우팅 (A3/A5/A2/A6/null). evidence 종류 + `Maintenance.consumable`(소모품 여부, 추출 시 LLM 판단)로 계산. agent는 이 키만 보고 체인에 배정하면 된다.
 - **`path`** — 그래프에서 이 가설이 지나온 경로의 노드 id들. fab 조인 키(step, evidence)와 그래프 역추적 키(failure_mode, cause)를 담는다.
 - **`verification`** — agent가 검증 쿼리를 조립하는 데 필요한 인자: 조회할 fab 테이블과 예상 이탈 방향.
 - **`score`** — 순위 성분. 전부 문헌에서 측정한 값이며 LLM 자기평가는 없다.
@@ -44,6 +45,7 @@
 | `hypotheses[].rank` | `1` | 검증 착수 순서 (문헌 근거 빈도순) |
 | `hypotheses[].sentence` | 한국어 가설 문장 | 사람 보고용 · Critic의 faithfulness 대조 대상 |
 | `hypotheses[].tier` | `자동` \| `반자동` \| `근거없음` | 검증 시나리오 분기 (agent 판정 / 조회 후 사람 / 검증 불가). **순위와 무관** |
+| `hypotheses[].scenario_hint` | `A3` \| `A5` \| `A2` \| `A6` \| `null` | MCP 검증 체인 배정: Parameter→A3, Recipe→A5, Maintenance→consumable이면 A6·아니면 A2, 근거없음→null. 소급 노드(consumable 미저장)는 키워드 휴리스틱 임시 판정 — 재추출 시 노드 속성으로 대체 |
 | `path.signature` | `ring@edge` \| `null` | 형상 경유 여부와 통과 시그니처 (경로 종류는 path의 null 패턴으로 판별) |
 | `path.step` | `ETCH` \| `null` | T3 commonality의 `step` 옵션 값 · `lot_history.step` 조인 키. `null`이면 문헌 직결 |
 | `path.failure_mode` | `incorrect_etch_rate` | 어떤 고장 모드를 경유했는지 (그래프 역추적 키) |

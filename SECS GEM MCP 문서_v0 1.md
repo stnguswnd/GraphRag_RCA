@@ -127,7 +127,7 @@ A6. 소모품 수명 / 교체 이력 검증 (Scratch 특화)
     - VLM 판독이 Scratch
     - Scratch의 후보 원인 3종(CMP 패드 마모, 슬러리 대입자, 세정 브러시)이 모두 소모품 및 연속 사용 마모 계열이므로, 교체 이력과 사용량 파라미터가 결정적 단서임
 - 시퀀스:
-    1. A1을 `step=CMP`, `step=세정`으로 각각 실행해 몰림 장비를 좁힘 (T3 보조)
+    1. A1을 `step=CMP`, `step=CLEAN`으로 각각 실행해 몰림 장비를 좁힘 (T3 보조)
     2. T7 `get_maintenance_history(해당 장비, time_range)` : 교체 부품 필드에서 패드/컨디셔너/브러시 교체 시점 확인
     3. T5 `query_telemetry(params=[패드 사용 시간, 슬러리 유량, 브러시 압력 등])` : 마모 누적 또는 입자 이상 신호 확인
     4. 교체 시점 및 드리프트와 불량 lot 처리 시각의 선후 판정 (A2와 동일, T9 보조)
@@ -144,15 +144,15 @@ A6. 소모품 수명 / 교체 이력 검증 (Scratch 특화)
     
     | 클래스 | 후보 원인 (배정 확률) | 검증 체인 | 결정적 단서가 놓이는 곳(신호원) |
     | --- | --- | --- | --- |
-    | **Center** | **증착 챔버 중심부 불균일 — 샤워헤드 막힘 (55%)** | **A1(step=증착) → A3(유량/압력) → A4** | **증착 장비 텔레메트리 드리프트** |
+    | **Center** | **증착 챔버 중심부 불균일 — 샤워헤드 막힘 (55%)** | **A1(step=DEPO) → A3(유량/압력) → A4** | **증착 장비 텔레메트리 드리프트** |
     | Center | CMP 중심 과연마 (25%) | A1(step=CMP) → A3(연마 압력/패드) → A2 | CMP 파라미터 or 정비 직후 시점 |
-    | ~~Center~~ | ~~세정 노즐 중심 분사 이상 (20%)~~ | ~~A1(step=세정) → A4 → A2~~ | ~~세정 장비 알람/BM 이력~~ |
-    | **Edge-Ring** | **식각 불균일 — 에지 플라즈마 밀도 (60%)** | **A1(step=식각) → A3(RF power/압력) → A4** | **etcher chamber 텔레메트리** |
+    | ~~Center~~ | ~~세정 노즐 중심 분사 이상 (20%)~~ | ~~A1(step=CLEAN) → A4 → A2~~ | ~~세정 장비 알람/BM 이력~~ |
+    | **Edge-Ring** | **식각 불균일 — 에지 플라즈마 밀도 (60%)** | **A1(step=ETCH) → A3(RF power/압력) → A4** | **etcher chamber 텔레메트리** |
     | Edge-Ring | CMP 엣지 과연마 (25%) | A1(step=CMP) → A3 → A2 | CMP 정비(패드 교체) 선후 |
-    | Edge-Ring | 세정 문제 (15%) | A1(step=세정) → A4 → A2 | 세정 알람/정비 |
+    | Edge-Ring | 세정 문제 (15%) | A1(step=CLEAN) → A4 → A2 | 세정 알람/정비 |
     | **Scratch** | **CMP 패드 마모/컨디셔닝 이상 (45%)** | **A1(step=CMP) → A6(패드 교체 이력·사용 시간) → A2** | **패드 사용 시간 누적 + 교체 선후** |
     | Scratch | CMP 슬러리 대입자 오염 (35%) | A1(step=CMP) → A6(슬러리 유량/입자) → A4 | 슬러리 계열 텔레메트리 및 알람 (교체 주기와 무관) |
-    | Scratch | 세정 브러시 접촉 이상 (20%) | A1(step=세정) → A6(브러시 교체 이력) → A2 | 세정 정비 선후 |
+    | Scratch | 세정 브러시 접촉 이상 (20%) | A1(step=CLEAN) → A6(브러시 교체 이력) → A2 | 세정 정비 선후 |
     - 참고 (결함 및 원인 세부 설명)
         - Center
             - 특징: 웨이퍼의 기하학적 중심 부근에 불량 die가 집중된 형태
@@ -388,7 +388,7 @@ E5
 - 데이터 설계
     - 진짜 원인은 “증착 챔버 중심부 불균일 (샤워헤드 막힘, 누적형 드리프트)”
     : CVD-03/CH-A의 샤워헤드 막힘
-        - `shower_flow`가 정비 이벤트없이 점진 하강하는 누적형 드리프트(A1(step=증착) → A3(유량/압력) → A4)
+        - `shower_flow`가 정비 이벤트없이 점진 하강하는 누적형 드리프트(A1(step=DEPO) → A3(유량/압력) → A4)
         - 함정으로
             - (a) CVD-03에 무관 배경 알람 `HEATER_TEMP_DEV`가 전 기간 산발 주입(교란 신호)
             - (b) CLEAN-01은 불량 lot 다수가 통과하지만 정상 lot도 대량 통과(negative evidence 함정)
@@ -402,7 +402,7 @@ E5
 2. KG 질의 (MCP 밖) → 후보: 샤워헤드 막힘 / CMP 중심 과연마 / 세정 노즐 분사 이상
 3. T2 ×10 (불량 lot 10개 이력) ∥ 병렬
 4. T3 run_commonality_analysis(10 lots,
-step=증착) → CVD-03/CH-A 9/10 (90%) [A1 → KG 최우선 후보 공정으로 1차 축소]
+step=DEPO) → CVD-03/CH-A 9/10 (90%) [A1 → KG 최우선 후보 공정으로 1차 축소]
     
     → 가설 H1: CVD-03/CH-A 샤워헤드 막힘
     
@@ -424,7 +424,7 @@ metric=shower_flow, scope=CVD-03) → 변화점 D-25, 인접 이벤트 없음(PM
 11. T3 run_commonality_analysis(10 lots) → step 미지정 전체 재호출: CLEAN-01 8/10 (80%), CMP 계열 분산(최대 4/10) [A1 분기 → H2 몰림 없음 → 약화]
 12. T4 get_normal_lot_ratio(CLEAN-01) → 통과 195 lot 중 불량 9 (배경 수준) [B1 → H3 기각 결정 (함정(b)에 해당)]
 13. evidence table 조립:
-H1 지지: commonality 90%(step=증착) / D-25 시작 드리프트 및 D-12 범위 이탈 / FLOW_LOW 동시성 / 시간 정합
+H1 지지: commonality 90%(step=DEPO) / D-25 시작 드리프트 및 D-12 범위 이탈 / FLOW_LOW 동시성 / 시간 정합
 반대: 없음 미확인: D-22~D-21 결측(coverage.missing) 배제: HEATER_TEMP_DEV(B3)
 H2 지지 없음(몰림 없음) → 약화 H3 반대: 정상 lot 다수 통과 → 기각
 14. Critic: D1 (T9 재확인, 통과) / D2 (T4 기록 존재+재호출 일치, 통과)
@@ -453,7 +453,7 @@ H2 지지 없음(몰림 없음) → 약화 H3 반대: 정상 lot 다수 통과 �
 5. T4 get_normal_lot_ratio(ETCH-02/CH-B) → 통과 84 lot 중 불량 15 (배경 불량률의 6배) [B1 → 가설 유지 결론]
 6. T7 get_maintenance_history(ETCH-02) → D-31 PM (ETCH 링 부품 교체) [A2]
 7. T5 query_telemetry(ETCH-02, D-31..D-1,
-params=[RF_power]) → D-31 이후 계단형 드리프트, 정상 범위 이탈 [A3 → 가설 지지 결론]
+params=[rf_power]) → D-31 이후 계단형 드리프트, 정상 범위 이탈 [A3 → 가설 지지 결론]
 8. T9 get_lot_timeline(L4522) → PM(D-31) < 드리프트 < L4522 식각(D-18) [B2 → 시간 정합성 통과]
     
     → 가설 H2: CMP-01 에지 과연마
@@ -495,7 +495,7 @@ params=[RF_power]) → D-31 이후 계단형 드리프트, 정상 범위 이탈 
 3. 동일 기간 동일 판독 lot 수집 → 6 lot (하한 5 이상 → 통계 판단 가능하나 소모수 명심, A6 특이점)
 4. T2 ×6 (불량 lot 6개 이력) ∥ 병렬
 5. T3 run_commonality_analysis(6 lots, step=CMP) → CMP-02/PLATEN-1 6/6 (100%, n=6)
-T3 run_commonality_analysis(6 lots, step=세정) → 분산(최대 3/6) [A6-1 → H3 세정 브러시 조기 약화]
+T3 run_commonality_analysis(6 lots, step=CLEAN) → 분산(최대 3/6) [A6-1 → H3 세정 브러시 조기 약화]
     
     →가설 H1: CMP-02 패드 마모/컨디셔닝 이상
     

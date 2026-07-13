@@ -81,6 +81,7 @@ RETURN s.id            AS step,
          ELSE 'None'
        END             AS evidence_label,
        coalesce(e.fab_table, '-') AS fab_table,
+       e.consumable    AS consumable,
        vb.direction    AS direction,
        a.occurrence_prior AS occurrence_prior,
        (coalesce(a.extraction_confidence, 3)
@@ -117,6 +118,7 @@ RETURN g.id            AS signature,
          ELSE 'None'
        END             AS evidence_label,
        coalesce(e.fab_table, '-') AS fab_table,
+       e.consumable    AS consumable,
        vb.direction    AS direction,
        f.occurrence_prior AS occurrence_prior,
        (coalesce(f.extraction_confidence, 3)
@@ -149,6 +151,7 @@ RETURN 'direct'        AS route,
          ELSE 'None'
        END             AS evidence_label,
        coalesce(e.fab_table, '-') AS fab_table,
+       e.consumable    AS consumable,
        vb.direction    AS direction,
        NULL            AS occurrence_prior,
        coalesce(at.extraction_confidence, 3) AS confidence,
@@ -192,6 +195,38 @@ TIER_OF_LABEL = {
 }
 
 TIER_TAG = {TIER_AUTO: "자동", TIER_SEMI: "반자동", TIER_NONE: "근거없음"}
+
+# =========================
+# 1.1b 시나리오 힌트 (MCP 문서 3.1의 검증 체인 라우팅)
+# -------------------------
+# evidence 종류가 검증 체인을 정한다: Parameter->A3, Recipe->A5,
+# Maintenance는 소모품(A6)/일반 정비(A2)로 갈린다 — Maintenance.consumable이 그 사실.
+# consumable은 추출 시 LLM이 문헌 문맥으로 판단해 노드에 저장된다.
+# 속성이 없는 소급분(재추출 전 노드)은 아래 키워드 휴리스틱으로 임시 판정한다.
+# =========================
+
+CONSUMABLE_KEYWORDS = ("pad", "brush", "slurry", "filter", "conditioner", "conditioning")
+
+
+def _consumable_heuristic(evidence_id: str, evidence_name: str) -> bool:
+    text = f"{evidence_id} {evidence_name}".lower()
+    return any(k in text for k in CONSUMABLE_KEYWORDS)
+
+
+def scenario_hint(row: dict) -> str | None:
+    """이 가설을 MCP 어느 검증 체인으로 보낼지. [근거없음]은 배정 체인 없음(None)."""
+    label = row["evidence_label"]
+    if label == "Parameter":
+        return "A3"
+    if label == "Recipe":
+        return "A5"
+    if label == "Maintenance":
+        consumable = row.get("consumable")
+        if consumable is None:   # 소급분 — 임시 휴리스틱 (재추출 시 노드 속성으로 대체됨)
+            consumable = _consumable_heuristic(row["evidence"] or "", row["evidence_name"] or "")
+        return "A6" if consumable else "A2"
+    return None
+
 
 LEGEND = """검증 등급 — 'fab.db에 있느냐'가 아니라 '에이전트가 스스로 판정할 수 있느냐'로 가릅니다.
   [자동]     Parameter. telemetry.param과 결정적으로 조인되고 정상범위로 판정 가능. 에이전트가 결론까지 냅니다.
@@ -626,9 +661,11 @@ def main() -> None:
                     f" 를 정상범위와 비교 (예상 이탈 방향: {row['direction']}){src}"
                 )
             elif row["tier"] == TIER_SEMI:
+                hint = scenario_hint(row)
                 print(
                     f"   검증: [반자동] agent가 {row['fab_table']} 테이블을 조회, 판정은 사람이"
                     f" — {row['evidence_name']}"
+                    + (f" (체인 {hint})" if hint else "")
                 )
             else:
                 print("   검증: [근거없음] fab 데이터에 연결되지 않음. 문헌 서술로만 존재합니다")
@@ -651,6 +688,8 @@ def main() -> None:
                 "rank": i,
                 "sentence": sentence,
                 "tier": TIER_TAG[row["tier"]],
+                # MCP 검증 체인 라우팅: A3(텔레메트리)/A5(레시피)/A2(일반 정비)/A6(소모품)/null(체인 없음)
+                "scenario_hint": scenario_hint(row),
                 "path": {
                     "signature": row["signature"],
                     "step": row["step"],

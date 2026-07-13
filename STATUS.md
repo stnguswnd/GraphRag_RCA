@@ -12,17 +12,19 @@
 data/raw/ 문헌 → 표 행 단위 청킹 → Neo4j 적재 → LLM KG 추출(+검증 규칙) → 결정적 순회 + LLM 문장 합성
 ```
 
-**전 단계 실행 검증 완료.** 최신 실행 수치 (문헌 5편 → 청크 95개):
+**전 단계 실행 검증 완료.** 최신 실행 수치 (v2.4 + CLEAN 문서, 2026-07-13 / 문헌 6편 → 청크 111개):
 
-| | (v2.3, 2026-07-12 앵커 보강 후) |
+| | |
 |---|---|
-| 노드 | FailureMode 112 · Cause 234+ · Maintenance 108 · Recipe 20 (+시드: DefectPattern 3 · **SpatialSignature 3** · ProcessStep 6 · Parameter 20) |
-| 앵커 엣지 | ARISES_IN: Center→{CMP,DEPO,LITHO} · Edge-Ring→{CLEAN,ETCH} · Scratch→{CMP} / **FORMS_IN: ring@edge→{CLEAN,ETCH}** / ATTRIBUTED_TO 34 |
-| 가설 | **총 381건** — Center 255 (자동29/반자동117/근거없음109) · Edge-Ring 79 (5/32/42) · Scratch 47 (3/13/31) |
+| 노드 | FailureMode 120 · Cause 272 · Maintenance 134 · Recipe 18 · SpatialSignature(추출) 4 (+시드: DefectPattern 3 · ProcessStep 6 · Parameter 20) |
+| 앵커 엣지 | ARISES_IN: Center→{CMP,DEPO,LITHO} · Edge-Ring→{CLEAN,DEPO,ETCH} · Scratch→{CLEAN,CMP} / FORMS_IN: blob@center→{CMP,DEPO} |
+| 가설 | **총 642건** — Center 297 · Edge-Ring 249 (CMP 경유 51 포함) · Scratch 96 |
+| 매핑표 대응 | MCP 매핑표(취소선 제외 8항목) 패턴→공정 **누락 0** — X2 완전 해소 |
 
-가설 수가 는 주원인은 `[근거없음]` 노출 (공정 경유 경로의 VERIFIED_BY를 OPTIONAL로 —
-evidence 없는 원인이 통째로 사라지던 비대칭 제거). 형상 경유 가설이 표면상 0건인 것은
-현재 FORMS_IN이 닿는 공정을 ARISES_IN도 전부 덮어서 dedup이 step 경로를 대표로 남기기 때문
+`[근거없음]`이 큰 비중인 것은 의도된 노출(evidence 없는 원인도 가설로 냄).
+CLEAN 경유 가설 72건(Scratch 36 + Edge-Ring 36), CLEAN 최초의 `[자동]` 경로
+(`insufficient_rinsing→rinse_time low`) 확보. 형상 경유 가설이 표면상 0건인 것은
+FORMS_IN이 닿는 공정을 ARISES_IN도 덮어서 dedup이 step 경로를 대표로 남기기 때문
 (설계 의도. 형상 경로의 독립 가치는 미지 패턴 + ARISES_IN 부재 시의 fallback).
 
 질문은 `"{패턴} 결함 패턴이 나타나는 근본 원인은 무엇인가요?"` 하나로 고정.
@@ -98,7 +100,24 @@ evidence 없는 원인이 통째로 사라지던 비대칭 제거). 형상 경�
    어휘만 코드 enum(shape 6종 × zone 4종)으로 닫고 id는 `{shape}@{zone}` 조합 —
    허브 노드 파편화가 구조적으로 불가능. 가드: 형상 표현이 원문에 있어야 인정 + 국소성.
    VLM 입력 모듈(미래)은 자유 서술을 같은 enum으로 분류해 진입 (문서 추출과 동일한 분류 계약).
-
+10. **(07-13) CLEAN 커버리지 확보 + 앵커 모델 옵션**: `...TABLE+CLEAN.md`(6장 산문 재구성
+   표 6행) 투입 → CLEAN FailureMode 7종, Scratch·Edge-Ring의 CLEAN 경유 가설 각 36건.
+   진입점 재발 문제 둘을 함께 해결: ① 프롬프트에 **헤딩 규칙** 추가("## Scratch pattern —
+   Cleaning" 헤딩 = 그 단락은 해당 패턴 서술 → ARISES_IN 생성), ② mini가 예시를 줘도 못 만드는
+   엣지는 **`ANCHOR_MODEL`** 환경변수로 보강 패스만 상위 모델 사용 (gpt-5.5가 c09에서 1회에
+   `Scratch→CLEAN` + `insufficient_rinsing→rinse_time`[CLEAN 최초 자동] 추출 성공).
+   구판 표 문서는 `_reference/`로 이동(이중 적재 방지). X2잔여는 `Edge-Ring→CMP`만 남음.
+11. **(07-13) `Edge-Ring→CMP` 확보 → X2 완전 해소**: `edgering-cmp.txt`(Xie & Boning,
+   MIT/MRS 2005 — CMP edge over-polish 기전 + 큐레이션 메타데이터 "Related Defect: Edge Ring")
+   투입. retaining ring(부품)↔ring(패턴) 어휘 함정은 프롬프트 가드로 선차단, gpt-5.5 2패스로
+   추출 — 본문 청크에서 가짜 패턴 0건 확인. 개명 중복 문서(`pattern_cause`→
+   `edge-ring_pattern_cause.txt`)의 그래프 잔재 정리. **MCP 매핑표 8항목 패턴→공정 누락 0** —
+   Edge-Ring이 4공정(CLEAN/CMP/DEPO/ETCH) 도달, 가설 총 642건.
+12. **(07-13) `scenario_hint` + `Maintenance.consumable` — 정합성검토 X5/Q4 해소**:
+   사실은 그래프에(`consumable`, 추출 시 LLM 판단), 라우팅은 출력에(`scenario_hint` =
+   Parameter→A3 / Recipe→A5 / Maintenance→consumable?A6:A2 / 근거없음→null).
+   소급 노드는 6번의 키워드 휴리스틱(pad/brush/slurry/filter/conditioner) 임시 판정 —
+   다음 재추출 시 노드 속성으로 대체. 실측 분포: A2 209 / A3 97 / A5 32 / A6 44 / null 260.
 
 ---
 
@@ -141,7 +160,10 @@ evidence 없는 원인이 통째로 사라지던 비대칭 제거). 형상 경�
   매핑을 프롬프트에 예시까지 줬는데도 gpt-5.4-mini가 안 만든다. 모델 업그레이드 또는 전층 다회화 검토.
 
 ### [P5] 커버리지 공백
-- `CLEAN`/`EDS`: 트러블슈팅 문헌 없음 (결정: 빈 공정으로 두고 문서 추가 예정).
+- ~~`CLEAN`: 트러블슈팅 문헌 없음~~ → **(07-13) 해소.** `...TABLE+CLEAN.md`(6장 산문 재구성 표 6행)로
+  CLEAN FailureMode 7종·CLEAN 경유 가설 72건(Scratch 36 + Edge-Ring 36) 확보.
+  `insufficient_rinsing→rinse_time`으로 CLEAN 최초의 `[자동]` 경로도 생김.
+- `EDS`: 트러블슈팅 문헌 여전히 없음 (빈 공정).
 - ref56 Table 1의 5개 패턴(`Donut`, `Edge-Loc`, `Loc`, `Near-Full`, `Random`)은 고정 3종 밖이라 버려짐.
   VLM 클래스를 9종으로 늘리면 그대로 살아남는 구조.
 - 표에 있으나 fab에 없는 변수(`gas flow @ ETCH`, `film stress` 등)는 관계로는 옳게 버려지되,
